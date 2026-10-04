@@ -12,22 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""In-memory cache of synthesized schedules keyed by normalized interests."""
+"""Caching of synthesized schedules with Micronaut Cache.
+
+The ``schedules`` cache (Caffeine, configured under ``micronaut.caches.schedules``)
+is keyed by the normalized interests, so case and whitespace variations of a
+query share one entry. Only valid schedules are cached: a rejected schedule is
+raised as ``RejectedSchedule``, and failed invocations are never cached.
+"""
 
 from __future__ import annotations
 
-import logging
 import re
-import threading
-import time
-from dataclasses import dataclass
+from typing import Annotated
 
-from jakarta.inject import Singleton
-from micronaut.context.annotation import ConfigurationProperties
+from jakarta.inject import Named, Singleton
+from java.lang import Object
+from micronaut.cache import SyncCache
+from micronaut.cache.annotation import Cacheable, CacheConfig
 
 from .models import ScheduleResponse
+from .workflow import DevoxxAgentWorkflowService, ProgressListener
 
-LOG = logging.getLogger(__name__)
+SCHEDULES_CACHE = "schedules"
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -39,78 +45,59 @@ def normalize_key(raw: str | None) -> str:
     return _WHITESPACE.sub(" ", raw.strip().lower())
 
 
-@dataclass
-class CacheEntry:
-    response: ScheduleResponse
-    created_at: float
+class RejectedSchedule(Exception):
+    """Carries a rejected (invalid) schedule out of a cached method so it is not cached."""
 
-    def is_expired(self, ttl_seconds: float, now: float) -> bool:
-        return (now - self.created_at) > ttl_seconds
+    def __init__(self, response: ScheduleResponse):
+        super().__init__(response.validation_message)
+        self.response = response
 
 
-class ScheduleCache:
-    def __init__(self, enabled: bool = True, ttl_minutes: int = 120, max_entries: int = 500):
-        self.enabled = enabled
-        self.ttl_seconds = max(1, ttl_minutes) * 60.0
-        self.max_entries = max(10, max_entries)
-        self._entries: dict[str, CacheEntry] = {}
-        self._lock = threading.Lock()
+def rejected_from_error(error: BaseException) -> ScheduleResponse | None:
+    """Returns the rejected schedule carried by ``error``, if it is (or wraps) a ``RejectedSchedule``.
 
-    def get(self, raw_interests: str | None) -> ScheduleResponse | None:
-        if not self.enabled:
+    Exceptions raised by a coroutine behind a Micronaut AOP proxy (here the
+    ``@Cacheable`` interceptor) currently come back wrapped as
+    ``CompletionException`` -> ``PolyglotException`` rather than as the original
+    Python exception, so the cause chain is searched for the guest exception.
+    """
+    current: object | None = getattr(error, "java_exception", None) or error
+    for _ in range(10):
+        if current is None:
             return None
-        key = normalize_key(raw_interests)
-        if not key:
-            return None
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                return None
-            if entry.is_expired(self.ttl_seconds, time.time()):
-                del self._entries[key]
-                return None
-            return entry.response
-
-    def put(self, raw_interests: str | None, response: ScheduleResponse | None) -> None:
-        if not self.enabled or response is None or not response.valid:
-            return
-        key = normalize_key(raw_interests)
-        if not key:
-            return
-        with self._lock:
-            if len(self._entries) >= self.max_entries:
-                self._evict_expired_or_oldest()
-            self._entries[key] = CacheEntry(response, time.time())
-            LOG.debug("Cached synthesized schedule for query: '%s' (cache size: %d)", key, len(self._entries))
-
-    def _evict_expired_or_oldest(self) -> None:
-        now = time.time()
-        for key in [k for k, e in self._entries.items() if e.is_expired(self.ttl_seconds, now)]:
-            del self._entries[key]
-        if len(self._entries) >= self.max_entries:
-            # Evict the oldest 20% of entries
-            to_evict = max(1, self.max_entries // 5)
-            oldest = sorted(self._entries.items(), key=lambda kv: kv[1].created_at)[:to_evict]
-            for key, _ in oldest:
-                del self._entries[key]
-
-    def size(self) -> int:
-        with self._lock:
-            return len(self._entries)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-
-
-@ConfigurationProperties("cache.schedule")
-class ScheduleCacheConfig:
-    enabled: bool = True
-    ttl_minutes: int = 120
-    max_entries: int = 500
+        if isinstance(current, RejectedSchedule):
+            return current.response
+        if hasattr(current, "isGuestException") and current.isGuestException():
+            current = current.getGuestObject()
+            continue
+        current = current.getCause() if hasattr(current, "getCause") else getattr(current, "__cause__", None)
+    return None
 
 
 @Singleton
-class ScheduleCacheBean(ScheduleCache):
-    def __init__(self, config: ScheduleCacheConfig):
-        super().__init__(config.enabled, config.ttl_minutes, config.max_entries)
+@CacheConfig(SCHEDULES_CACHE)
+class ScheduleCache:
+    def __init__(
+        self,
+        workflow_service: DevoxxAgentWorkflowService,
+        cache: Annotated[SyncCache, Named(SCHEDULES_CACHE)],
+    ):
+        self.workflow_service = workflow_service
+        self.cache = cache
+
+    @Cacheable(parameters=["key"])
+    async def schedule(self, key: str, interests: str, progress: ProgressListener | None) -> ScheduleResponse:
+        """Synthesizes the schedule for ``interests``, cached under its normalized ``key``.
+
+        ``progress`` receives the workflow's progress events on a cache miss.
+        """
+        response = await self.workflow_service.process_schedule_request(interests, progress)
+        if not response.valid:
+            raise RejectedSchedule(response)
+        return response
+
+    def get(self, key: str) -> ScheduleResponse | None:
+        """Returns the cached schedule for a normalized key without synthesizing one."""
+        if not key:
+            return None
+        return self.cache.get(key, Object).orElse(None)

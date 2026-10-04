@@ -35,13 +35,12 @@ import logging
 import time
 from typing import Any, Callable
 
-import java
 from dev.langchain4j.agentic.scope import AgenticScope, DefaultAgenticScope
 from dev.langchain4j.invocation import LangChain4jManaged
 from jakarta.inject import Singleton
+from java.util import Map
 
 from .agent_listeners import AGENT2
-from .progress import REQUEST_ID_KEY, ProgressListener, ProgressRegistry
 from .agents import (
     InterestValidatorAgent,
     ParallelScheduleBuilderWorkflow,
@@ -68,8 +67,7 @@ from .models import (
     scheduled_from_catalog,
     talk_abstract,
 )
-
-JMap = java.type("java.util.Map")
+from .progress import REQUEST_ID_KEY, ProgressListener, ProgressRegistry
 
 LOG = logging.getLogger(__name__)
 
@@ -119,7 +117,7 @@ async def run_agent(scope: Any, call: Callable[[], Any]) -> Any:
     """
 
     def invoke() -> Any:
-        LangChain4jManaged.setCurrent(JMap.of(AgenticScope, scope))
+        LangChain4jManaged.setCurrent(Map.of(AgenticScope, scope))
         try:
             return call()
         finally:

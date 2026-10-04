@@ -2,7 +2,6 @@
 
 import pytest
 import requests
-
 from pyronaut.test import MicronautTest, micronaut_test_fixture
 
 

@@ -21,13 +21,17 @@ import logging
 import threading
 from typing import Annotated
 
-import java
 from dev.langchain4j.model.chat import ChatModel
+from java.net import URI
+from java.util.concurrent import Semaphore
 from micronaut.http import HttpRequest, HttpResponse, HttpStatus, MediaType
 from micronaut.http.annotation import Body, Controller, Get, Post, QueryValue
 from micronaut.http.sse import Event
+from org.reactivestreams import Publisher
+from reactor.core.publisher import Flux, Sinks
 
-from .cache import ScheduleCacheBean
+from .agent_listeners import AGENT2
+from .cache import ScheduleCache, normalize_key, rejected_from_error
 from .client_ip import resolve_client_ip, resolve_session_id
 from .conference import DevoxxConferenceService
 from .models import (
@@ -42,14 +46,7 @@ from .models import (
     rejected_schedule,
 )
 from .rate_limiter import RateLimitDecision, RateLimiterService
-from .agent_listeners import AGENT2
 from .workflow import MAX_INTERESTS_LENGTH, DevoxxAgentWorkflowService, sanitize_for_log
-
-Flux = java.type("reactor.core.publisher.Flux")
-Sinks = java.type("reactor.core.publisher.Sinks")
-Publisher = java.type("org.reactivestreams.Publisher")
-URI = java.type("java.net.URI")
-Semaphore = java.type("java.util.concurrent.Semaphore")
 
 LOG = logging.getLogger(__name__)
 
@@ -106,7 +103,7 @@ class ScheduleController:
         workflow_service: DevoxxAgentWorkflowService,
         conference_service: DevoxxConferenceService,
         rate_limiter: RateLimiterService,
-        schedule_cache: ScheduleCacheBean,
+        schedule_cache: ScheduleCache,
         chat_model: ChatModel,
     ):
         self.workflow_service = workflow_service
@@ -140,8 +137,9 @@ class ScheduleController:
                 .body(rejected_schedule(_rate_limit_message(decision)))
             )
 
-        # 2. Check in-memory query cache
-        cached = self.schedule_cache.get(interests)
+        # 2. Check the schedule cache
+        cache_key = normalize_key(interests)
+        cached = self.schedule_cache.get(cache_key)
         if cached is not None:
             LOG.info("Serving schedule from cache for query: '%s'", sanitize_for_log(interests))
             return HttpResponse.ok(cached)
@@ -151,10 +149,12 @@ class ScheduleController:
             LOG.warning("Concurrently running schedule workflows limit reached (%d); rejecting request", MAX_CONCURRENT_WORKFLOWS)
             return HttpResponse.status(HttpStatus.SERVICE_UNAVAILABLE).body(rejected_schedule(BUSY_MESSAGE))
         try:
-            response = await self.workflow_service.process_schedule_request(interests)
-            if response.valid:
-                self.schedule_cache.put(interests, response)
-            return HttpResponse.ok(response)
+            return HttpResponse.ok(await self.schedule_cache.schedule(cache_key, interests, None))
+        except Exception as e:
+            rejected = rejected_from_error(e)
+            if rejected is None:
+                raise
+            return HttpResponse.ok(rejected)
         finally:
             self.workflow_limiter.release()
 
@@ -180,8 +180,9 @@ class ScheduleController:
             LOG.warning("Rate limit rejected streaming request for IP %s (session %s): %s", client_ip, session_id, decision.reason)
             return Flux.just(Event.of(progress_rejected(_rate_limit_message(decision), 0)))
 
-        # 2. Check in-memory query cache
-        cached = self.schedule_cache.get(clean_interests)
+        # 2. Check the schedule cache
+        cache_key = normalize_key(clean_interests)
+        cached = self.schedule_cache.get(cache_key)
         if cached is not None:
             LOG.info("Serving streaming schedule from cache for query: '%s'", sanitize_for_log(clean_interests))
             return Flux.just(
@@ -206,13 +207,14 @@ class ScheduleController:
 
         async def run_workflow() -> None:
             try:
-                response = await self.workflow_service.process_schedule_request(clean_interests, emit)
-                if response.valid:
-                    self.schedule_cache.put(clean_interests, response)
+                # Progress (including the rejection event) is streamed by the workflow itself
+                await self.schedule_cache.schedule(cache_key, clean_interests, emit)
             except asyncio.CancelledError:
                 LOG.info("Streaming schedule request cancelled by client")
                 raise
             except Exception as e:
+                if rejected_from_error(e) is not None:
+                    return
                 LOG.error("Error streaming schedule: %s", e)
                 emit(progress_rejected(
                     "An unexpected error occurred while curating the schedule. Please try again with different topics.", 0

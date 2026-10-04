@@ -29,9 +29,12 @@ import logging
 import threading
 from typing import Any
 
-import java
 from dev.langchain4j.model.chat import Capability, ChatModel
-from dev.langchain4j.model.chat.request import ChatRequest, ResponseFormat, ResponseFormatType
+from dev.langchain4j.model.chat.request import (
+    ChatRequest,
+    ResponseFormat,
+    ResponseFormatType,
+)
 from dev.langchain4j.model.chat.request.json import (
     JsonAnyOfSchema,
     JsonArraySchema,
@@ -46,11 +49,9 @@ from dev.langchain4j.model.chat.request.json import (
 )
 from dev.langchain4j.model.chat.response import ChatResponse
 from jakarta.inject import Singleton
+from java.util import HashSet, List
 from micronaut.context.event import BeanCreatedEvent, BeanCreatedEventListener
 from micronaut.jsonschema.utils import JsonSchemaClassPathResourceLoader
-
-JHashSet = java.type("java.util.HashSet")
-JList = java.type("java.util.List")
 
 LOG = logging.getLogger(__name__)
 
@@ -104,10 +105,10 @@ class GeneratedJsonSchemas:
             return self._element(target)
         description = schema.get("description")
         if "enum" in schema:
-            return JsonEnumSchema.builder().description(description).enumValues(JList.of(*[str(v) for v in schema["enum"]])).build()
+            return JsonEnumSchema.builder().description(description).enumValues(List.of(*[str(v) for v in schema["enum"]])).build()
         if "anyOf" in schema or "oneOf" in schema:
             variants = [self._element(s) for s in schema.get("anyOf") or schema.get("oneOf")]
-            return JsonAnyOfSchema.builder().description(description).anyOf(JList.of(*variants)).build()
+            return JsonAnyOfSchema.builder().description(description).anyOf(List.of(*variants)).build()
 
         schema_type = schema.get("type", "object")
         if isinstance(schema_type, list):
@@ -120,7 +121,7 @@ class GeneratedJsonSchemas:
             for name, property_schema in (schema.get("properties") or {}).items():
                 builder.addProperty(name, self._element(property_schema))
             if schema.get("required"):
-                builder.required(JList.of(*schema["required"]))
+                builder.required(List.of(*schema["required"]))
             if "additionalProperties" in schema and isinstance(schema["additionalProperties"], bool):
                 builder.additionalProperties(schema["additionalProperties"])
             return builder.build()
@@ -147,7 +148,7 @@ class SchemaAwareChatModel(ChatModel):
         self.schemas = schemas
 
     def supportedCapabilities(self):
-        capabilities = JHashSet(self.delegate.supportedCapabilities())
+        capabilities = HashSet(self.delegate.supportedCapabilities())
         capabilities.add(Capability.RESPONSE_FORMAT_JSON_SCHEMA)
         return capabilities
 

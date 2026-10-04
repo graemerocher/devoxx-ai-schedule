@@ -75,8 +75,8 @@ session-window-seconds = 60
 ip-limit = 60
 ip-window-seconds = 60
 
-# In-memory query schedule cache (avoids repeated Gemini calls for common prompts)
-[cache.schedule]
-enabled = true
-ttl-minutes = 120
-max-entries = 500
+# Cache of synthesized schedules keyed by normalized interests (avoids
+# repeated Gemini calls for common prompts). See dvxaisched.cache.
+[micronaut.caches.schedules]
+expire-after-write = "120m"
+maximum-size = 500

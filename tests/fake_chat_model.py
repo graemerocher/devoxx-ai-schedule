@@ -14,17 +14,15 @@ import threading
 import time
 from typing import Any
 
-import java
 from dev.langchain4j.agent.tool import ToolExecutionRequest
 from dev.langchain4j.data.message import AiMessage
 from dev.langchain4j.model.chat import ChatModel
 from dev.langchain4j.model.chat.request import ChatRequest, ChatRequestParameters
 from dev.langchain4j.model.chat.response import ChatResponse
 from jakarta.inject import Singleton
+from java.util import List
 from micronaut.context.annotation import ConfigurationProperties, Primary, Requires
 from micronaut.http.annotation import Controller, Delete, Get
-
-JList = java.type("java.util.List")
 
 TASK_VALIDATE = "validate-interests"
 TASK_PLAN_DAY = "plan-day"
@@ -194,7 +192,7 @@ class FakeChatModel(ChatModel):
                 ]
                 with self._lock:
                     self.tools_called.extend(r.name() for r in requests)
-                return ChatResponse.builder().aiMessage(AiMessage.from_(JList.of(*requests))).build()
+                return ChatResponse.builder().aiMessage(AiMessage.from_(List.of(*requests))).build()
 
             text = json.dumps(answer(task, user, tool_results))
             return ChatResponse.builder().aiMessage(AiMessage.from_(text)).build()

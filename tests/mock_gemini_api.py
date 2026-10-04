@@ -12,12 +12,11 @@ import json
 import threading
 from typing import Annotated, Any
 
+from fake_chat_model import answer, task_for
 from jakarta.inject import Singleton
 from micronaut.context.annotation import Requires
 from micronaut.http import HttpRequest, HttpResponse
 from micronaut.http.annotation import Body, Controller, Get, Post
-
-from fake_chat_model import answer, task_for
 
 
 @Singleton

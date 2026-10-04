@@ -39,8 +39,13 @@ from micronaut.langchain4j.agentic.annotation import AgenticService
 from micronaut.langchain4j.annotation import AiService
 
 from .conference import DevoxxConferenceService
-from .models import DayPlanRequest, PlannedDay, PlannedSchedule, TalkAlternativesResult, ValidationResult
-
+from .models import (
+    DayPlanRequest,
+    PlannedDay,
+    PlannedSchedule,
+    TalkAlternativesResult,
+    ValidationResult,
+)
 
 # ---------------------------------------------------------------------------
 # Tools available to the monolithic schedule builder

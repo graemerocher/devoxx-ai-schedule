@@ -79,6 +79,8 @@ runtime = [
   # Chat model provider: Gemini by default. Swap (or add) another provider
   # module such as micronaut-langchain4j-openai or -ollama to change backend.
   "io.micronaut.langchain4j:micronaut-langchain4j-googleai-gemini",
+  # Caching of synthesized schedules (@Cacheable) backed by Caffeine
+  "io.micronaut.cache:micronaut-cache-caffeine",
   # Compile-time JSON schemas of the agents' structured outputs
   "io.micronaut.jsonschema:micronaut-json-schema-annotations",
   "io.micronaut.jsonschema:micronaut-json-schema-utils",

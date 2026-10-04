@@ -26,18 +26,16 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-import java
 from dev.langchain4j.agentic.agent import AgentBuilder, ErrorRecoveryResult
 from dev.langchain4j.agentic.observability import AgentListener
 from dev.langchain4j.agentic.workflow import ParallelMapperService
 from jakarta.inject import Named, Singleton
+from java.util.concurrent import ExecutorService
 from micronaut.context.event import BeanCreatedEvent, BeanCreatedEventListener
 from micronaut.scheduling import TaskExecutors
 
 from .models import WorkflowProgressEvent
 from .progress import ProgressRegistry
-
-ExecutorService = java.type("java.util.concurrent.ExecutorService")
 
 LOG = logging.getLogger(__name__)
 

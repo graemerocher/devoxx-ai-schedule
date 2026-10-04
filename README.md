@@ -87,7 +87,11 @@ flowchart TD
 - The agents' output types (`ValidationResult`, `PlannedDay`, `PlannedSchedule`, `TalkAlternativesResult`, …) are `@JsonSchema` dataclasses. Micronaut JSON Schema generates their schemas at compile time, using the docstrings as property descriptions and marking non-nullable properties as required (`strictMode`).
 - `SchemaAwareChatModel` decorates whichever `ChatModel` bean is configured. It sends those generated schemas as the structured-output response format, in place of the schema LangChain4j would derive by reflection.
 
-### 8. Interactive Slot Re-Curator (`TalkAlternativeAgent`)
+### 8. Schedule Cache (Micronaut Cache)
+- Synthesized schedules are cached with Micronaut Cache's `@Cacheable` (Caffeine) under the normalized interests, so case and whitespace variations of a query share one entry. Settings live under `micronaut.caches.schedules` (`expire-after-write`, `maximum-size`).
+- Only valid schedules are cached. A rejected schedule leaves the cached method as an exception, and Micronaut Cache never caches failed invocations.
+
+### 9. Interactive Slot Re-Curator (`TalkAlternativeAgent`)
 - **Role:** Lets attendees swap a talk they've already seen, or whose topic they know too well, for a compelling alternative.
 - **Workflow:**
   - Finds parallel sessions in other rooms for that exact time slot.
@@ -137,6 +141,7 @@ No agent code changes. If several chat models are configured, pick one per agent
 - **Framework:** [Pyronaut](https://pyronaut.io) 0.0.10 / Micronaut 5.2 (Netty HTTP server, Serialization, Project Reactor, asyncio bridge)
 - **Agentic AI:** LangChain4j 1.20 (`langchain4j-agentic`) via Micronaut LangChain4j 2.3
 - **Structured outputs:** Micronaut JSON Schema 2.3 (compile-time `@JsonSchema`)
+- **Caching:** Micronaut Cache with Caffeine (`@Cacheable`)
 - **LLM:** Google Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`), swappable for any LangChain4j provider
 - **Testing:** pytest through `pyronaut test` with `MicronautTest` fixtures and `requests.with_context`
 - **Cloud Infrastructure:** Google Cloud Run & Google Secret Manager
