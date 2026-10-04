@@ -22,13 +22,13 @@ import re
 
 from jakarta.annotation import PostConstruct
 from jakarta.inject import Singleton
-from micronaut.core.io import ResourceResolver
+from micronaut.context.env import Environment
 
 from .models import ConferenceTalk, conference_talk_from_dict, speakers_summary
 
 LOG = logging.getLogger(__name__)
 
-SCHEDULE_RESOURCE = "classpath:devoxx-be-2026.json"
+SCHEDULE_RESOURCE = "devoxx-be-2026.json"
 
 _HTML_TAG = re.compile(r"<[^>]*>")
 _WHITESPACE = re.compile(r"\s+")
@@ -48,13 +48,15 @@ def normalize_time(time: str | None) -> str:
 
 @Singleton
 class DevoxxConferenceService:
-    def __init__(self, resource_resolver: ResourceResolver):
-        self.resource_resolver = resource_resolver
+    def __init__(self, environment: Environment):
+        # Environment is the application's classpath ResourceLoader. (ResourceResolver is
+        # not yet registered for reflection in Pyronaut's native toolchain.)
+        self.environment = environment
         self.talks: list[ConferenceTalk] = []
 
     @PostConstruct
     def load_embedded_schedule(self) -> None:
-        stream = self.resource_resolver.getResourceAsStream(SCHEDULE_RESOURCE).orElse(None)
+        stream = self.environment.getResourceAsStream(SCHEDULE_RESOURCE).orElse(None)
         if stream is None:
             LOG.warning("devoxx-be-2026.json resource not found")
             return

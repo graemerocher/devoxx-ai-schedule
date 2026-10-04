@@ -305,6 +305,17 @@ class TalkAlternativesResult:
     """Up to 3 distinct alternatives"""
 
 
+# The @JsonSchema types whose generated schemas are sent to the chat model
+STRUCTURED_OUTPUT_TYPES: list[type] = [
+    ValidationResult,
+    PlannedTalk,
+    PlannedDay,
+    PlannedSchedule,
+    AlternativeSelection,
+    TalkAlternativesResult,
+]
+
+
 @Serdeable
 @dataclass
 class DayPlanRequest:

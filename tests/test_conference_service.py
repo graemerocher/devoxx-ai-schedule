@@ -5,7 +5,7 @@ from dvxaisched.conference import DevoxxConferenceService, has_overlap
 
 @pytest.fixture(scope="module")
 def conference_service(app_context):
-    service = DevoxxConferenceService(app_context["io.micronaut.core.io.ResourceResolver"])
+    service = DevoxxConferenceService(app_context["io.micronaut.context.env.Environment"])
     service.load_embedded_schedule()
     return service
 
