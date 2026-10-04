@@ -12,27 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-stage Dockerfile for Devoxx AI Scheduler (Micronaut + Java 25)
-FROM eclipse-temurin:25-jdk AS builder
-WORKDIR /workspace
-
-# Copy Gradle wrapper and build configuration
-COPY gradlew /workspace/
-COPY gradle /workspace/gradle
-COPY settings.gradle build.gradle gradle.properties /workspace/
-
-# Copy source code and resources
-COPY src /workspace/src
-
-# Build the standalone shadow JAR
-RUN ./gradlew shadowJar --no-daemon -x test
-
-# Runtime stage
-FROM eclipse-temurin:25-jre
+# Runtime image for the Pyronaut fat JAR. Build the JAR first with
+# `pyronaut build --jar` (or `just build`). The embedded GraalPy runtime needs a
+# GraalVM JDK so that Python code is JIT-compiled.
+FROM container-registry.oracle.com/graalvm/jdk:25
 WORKDIR /app
 
-# Copy the standalone executable fat JAR
-COPY --from=builder /workspace/build/libs/dvxaisched-0.1-all.jar /app/application.jar
+COPY dist/dvxaisched-0.1.0.jar /app/application.jar
 
 ENV PORT=8080
 EXPOSE 8080

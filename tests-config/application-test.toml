@@ -1,0 +1,15 @@
+# Tests run against a deterministic fake LLM backend (tests/fake_llm.py) so no
+# API key or network access is needed. Individual test modules switch to the
+# real Gemini / OpenAI-compatible clients pointed at mock endpoints.
+[llm]
+provider = "fake"
+
+[llm.gemini]
+api-key = "test-gemini-key"
+
+[micronaut.server]
+port = -1
+
+[ratelimit]
+session-limit = 1000
+ip-limit = 10000

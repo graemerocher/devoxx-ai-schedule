@@ -1,46 +1,53 @@
 # Devoxx Belgium 2026 AI Schedule Curator (`dvxaisched`)
 
-A modern Java 25 & Micronaut application that leverages **LangChain4j's Agentic Framework** and Google's **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`) to generate personalized, conflict-free, 5-day conference schedules for [Devoxx Belgium 2026](https://devoxx.be) (October 5–9, 2026 at Kinepolis Antwerp).
+A Python application built with [Pyronaut](https://pyronaut.io), which runs Python on Micronaut and GraalPy. It uses an agentic LLM pipeline, by default backed by Google's **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`), to generate personalized, conflict-free 5-day schedules for [Devoxx Belgium 2026](https://devoxx.be) (October 5–9, 2026, Kinepolis Antwerp).
+
+The LLM backend sits behind a small `LlmClient` abstraction. You can swap Gemini for any OpenAI-compatible API (OpenAI, Ollama, vLLM and others) through configuration, and the test suite runs against a deterministic fake backend, so no API key is needed.
 
 ---
 
 ## Architecture & Agent Structure
 
-The application is structured as a resilient, multi-stage agentic pipeline built with LangChain4j (`langchain4j-agentic` and `langchain4j-google-genai`).
+The application is a resilient, multi-stage agentic pipeline written with Python `async`/`await`. Pyronaut runs coroutines on Micronaut's Netty event loop, so the five day planners run concurrently with `asyncio.gather`, without blocking threads.
 
 ```mermaid
 flowchart TD
     User(["Attendee Input"]) --> UI["Web Interface / SSE Stream"]
     UI --> Controller["ScheduleController<br/>/api/schedule/stream"]
-    
-    subgraph Agentic_Pipeline ["DevoxxAgentWorkflowService"]
-        Controller --> Scope["AgenticScope & Observability Listener"]
-        
-        Scope --> Agent1["Agent 1: InterestValidatorAgent<br/>Security & Guardrail"]
+
+    subgraph Agentic_Pipeline ["DevoxxAgentWorkflowService (async)"]
+        Controller --> Agent1["Agent 1: InterestValidatorAgent<br/>Security & Guardrail"]
         Agent1 -- "Rejected" --> ShortCircuit["Short-circuit with polite explanation"]
-        
+
         Agent1 -- "Validated" --> Partition["Devoxx Catalog Partitioning<br/>Pre-scores & filters 200 talks into 5 days"]
-        
-        Partition --> ParallelMapper["ParallelScheduleBuilderWorkflow<br/>@ParallelMapperAgent on Virtual Threads"]
-        
-        subgraph Parallel_Workers ["5 Concurrent Gemini 3.5 Flash-Lite Workers"]
-            ParallelMapper --> DayMon["Day 1: Monday Optimizer"]
-            ParallelMapper --> DayTue["Day 2: Tuesday Optimizer"]
-            ParallelMapper --> DayWed["Day 3: Wednesday Optimizer"]
-            ParallelMapper --> DayThu["Day 4: Thursday Optimizer"]
-            ParallelMapper --> DayFri["Day 5: Friday Optimizer"]
+
+        Partition --> Gather["asyncio.gather on the Netty event loop"]
+
+        subgraph Parallel_Workers ["5 concurrent DayScheduleBuilderAgent calls"]
+            Gather --> DayMon["Day 1: Monday Optimizer"]
+            Gather --> DayTue["Day 2: Tuesday Optimizer"]
+            Gather --> DayWed["Day 3: Wednesday Optimizer"]
+            Gather --> DayThu["Day 4: Thursday Optimizer"]
+            Gather --> DayFri["Day 5: Friday Optimizer"]
         end
-        
-        Parallel_Workers -. "Transient Error" .-> ErrorHandler["LangChain4j errorHandler<br/>ErrorRecoveryResult.retry"]
-        ErrorHandler -. "Retry (max 2)" .-> Parallel_Workers
-        
-        Parallel_Workers -- "5 Day Schedules" --> Enrich["Enrich with Full CFP Abstracts"]
-        Parallel_Workers -. "Fatal Failure" .-> Fallback["Fallback: Monolithic ScheduleBuilderAgent<br/>Equipped with DevoxxConferenceTools"]
+
+        Parallel_Workers -. "Transient Error" .-> Retry["Per-day retry (max 2)"]
+        Retry -. "Retry" .-> Parallel_Workers
+
+        Parallel_Workers -- "5 Day Schedules" --> Enrich["De-conflict, backfill & enrich with CFP abstracts"]
+        Parallel_Workers -. "Fatal Failure" .-> Fallback["Fallback: Monolithic ScheduleBuilderAgent"]
         Fallback --> Enrich
     end
 
+    subgraph Backends ["LlmClient (llm.provider)"]
+        Gemini["GeminiLlmClient<br/>(default)"]
+        OpenAI["OpenAiCompatibleLlmClient"]
+        Fake["FakeLlmClient<br/>(tests)"]
+    end
+    Agentic_Pipeline -. "generate_json()" .-> Backends
+
     Enrich --> Result(["Conflict-Free 5-Day Agenda"])
-    Scope -. "Live SSE Progress Events" .-> UI
+    Agentic_Pipeline -. "Live SSE Progress Events" .-> UI
 ```
 
 ### 1. Agent 1: Guardrail & Validator (`InterestValidatorAgent`)
@@ -49,59 +56,95 @@ flowchart TD
   - Evaluates user input against **prompt injection** and jailbreaks (`DAN`, instruction overrides, system prompt exfiltration).
   - Flags insults, profanity, harassment, or completely meaningless gibberish.
   - Verifies relevance to software engineering, cloud, architecture, developer culture, and technology.
-- **Outcome:** Produces a structured `ValidationResult`. If rejected, it immediately short-circuits the pipeline with a friendly explanation, saving LLM tokens and execution time.
+- **Outcome:** Produces a structured `ValidationResult`. A rejection short-circuits the pipeline with a friendly explanation, which saves tokens and time. If the validator itself fails, the request is rejected (fail-closed).
 
 ### 2. Fast Catalog Partitioning & Pre-Indexing
-- Before dispatching LLM calls, the service scores and pre-filters candidate talks from the 200 official Devoxx Belgium sessions against the attendee's validated interests.
-- Sessions are partitioned across the 5 distinct conference days according to Devoxx formatting rules (e.g. Deep Dives and Labs on Mon/Tue; Keynotes, Lunch talks, and Conference sessions on Wed/Thu/Fri).
+- Before any LLM call, the service scores the 200 official Devoxx Belgium sessions against the attendee's validated interests and keeps the best candidates.
+- Sessions are partitioned across the 5 conference days according to Devoxx formatting rules: Deep Dives and Labs on Mon/Tue; Keynotes, Lunch talks and Conference sessions on Wed/Thu/Fri.
 
-### 3. Agent 2: Parallel Day Mapper (`ParallelScheduleBuilderWorkflow`)
-- **Role:** Concurrently synthesizes conflict-free daily agendas.
-- **Parallel Mapper:** Uses LangChain4j's `@ParallelMapperAgent` mapped across **Java 25 virtual threads** (`Executors.newVirtualThreadPerTaskExecutor()`).
-- **Sub-Agent (`DayScheduleBuilderAgent`):** 5 concurrent Gemini 3.5 Flash-Lite workers each curate a single conference day:
+### 3. Agent 2: Parallel Day Optimizers (`DayScheduleBuilderAgent`)
+- **Role:** Builds conflict-free daily agendas concurrently.
+- **Concurrency:** Five `async` agent calls are awaited together with `asyncio.gather`. Each call awaits Micronaut's non-blocking HTTP client, so all five model requests are in flight at once on the Netty event loop.
+- Each worker curates one conference day:
   - Selects 3 to 6 top sessions matching attendee interests.
-  - Strictly enforces no overlapping time slots.
-  - Generates personalized curation rationales for each session.
-- **Performance Impact:** Reduces end-to-end synthesis time down to ~3–5 seconds by processing all 5 days simultaneously.
+  - Never picks overlapping time slots.
+  - Writes a personalized rationale for each session.
 
-### 4. Resilient Error Handling (`errorHandler`)
-- Configured with LangChain4j's native **`errorHandler`** on the parallel mapper builder.
-- **Granular Retries:** If a single day worker fails due to transient API rate limits or network issues, the handler intercepts the error and issues **`ErrorRecoveryResult.retry()`** up to 2 times for that specific day, without discarding the other 4 completed days.
-- **Progress Visibility:** Emits informative retry progress updates to the live UI.
+### 4. Resilient Error Handling
+- **Granular retries:** If one day worker fails (for example, a transient rate limit), only that day is retried, up to 2 times. The other days are kept, and each retry is reported to the live UI.
+- **Post-processing:** Any overlaps the model produced are removed, sparse days are backfilled from the catalog, and abstracts and URLs are always taken from the official dataset.
 
 ### 5. Multi-Tier Fallback Safety Net
-- **Tier 1:** Monolithic `ScheduleBuilderAgent` equipped with `DevoxxConferenceTools` (tool calling for session search, tracks, and favorites) runs if parallel mapping fails.
-- **Tier 2:** Deterministic catalog fallback if LLM services are completely unreachable.
+- **Tier 1:** The monolithic `ScheduleBuilderAgent` builds the whole week in a single call if the parallel stage fails.
+- **Tier 2:** A deterministic catalog schedule is returned if the LLM is completely unreachable.
 
 ### 6. Live Observability & Streaming SSE
-- Implements LangChain4j's `AgentListener` (`beforeAgentInvocation`, `afterAgentInvocation`, `beforeAgentToolExecution`, `afterAgentToolExecution`).
-- Hooks into `AgenticScope` and streams live progress events via Server-Sent Events (`/api/schedule/stream`) to render animated status cards in the web frontend.
+- `/api/schedule/stream` returns a Reactor `Flux` of Server-Sent Events. The workflow runs as an asyncio task on the request's event loop and pushes progress events into a Reactor sink as each stage and each day completes. These events drive the animated status cards in the web frontend.
 
 ### 7. Interactive Slot Re-Curator (`TalkAlternativeAgent`)
-- **Role:** Allows attendees to swap any talk they've already seen or already know too well for a compelling alternative.
+- **Role:** Lets attendees swap a talk they've already seen, or whose topic they know too well, for a compelling alternative.
 - **Workflow:**
-  - Identifies parallel sessions in other rooms for that exact time slot.
-  - Gemini 3.5 Flash-Lite evaluates attendee interests and curates the **top 3 alternatives**, generating custom personalized rationales for each.
-  - Attendee selects their preferred talk in a modal dialog, swapping it in-place in their agenda while automatically updating ICS calendar and Markdown exports.
+  - Finds parallel sessions in other rooms for that exact time slot.
+  - The LLM evaluates the attendee's interests and picks the **top 3 alternatives** with personalized rationales. The call is bounded by a 6-second `asyncio.wait_for` timeout, and a deterministic ranking takes over if it fails.
+  - The attendee picks a talk in a modal dialog. It replaces the original in place, and the ICS calendar and Markdown exports update automatically.
+
+---
+
+## Swappable LLM Backends
+
+Agents never talk to a vendor SDK directly. Each agent builds an `LlmRequest` (task name, system prompt, user prompt and a JSON schema for the structured answer) and awaits `LlmClient.generate_json()`. The implementation is a Micronaut bean selected by `llm.provider`:
+
+| `llm.provider` | Bean | Notes |
+| --- | --- | --- |
+| `gemini` (default) | `GeminiLlmClient` | Generative Language REST API `models/{model}:generateContent` with `responseJsonSchema` structured output. |
+| `openai` | `OpenAiCompatibleLlmClient` | Any `POST {base}/chat/completions` server that supports `response_format: json_schema`: OpenAI, Ollama, vLLM, LM Studio and others. |
+| `fake` | `FakeLlmClient` (tests only) | Deterministic answers derived from the prompt, with configurable failures and latency. |
+
+Settings are bound with `@ConfigurationProperties` and can be set in `config/application.toml` or through environment variables:
+
+```toml
+[llm]
+provider = "gemini"                 # LLM_PROVIDER
+
+[llm.gemini]
+api-key = "${GEMINI_API_KEY:}"
+model = "gemini-3.5-flash-lite"     # LLM_GEMINI_MODEL
+base-url = "https://generativelanguage.googleapis.com"
+temperature = 0.2
+
+[llm.openai]
+api-key = "${OPENAI_API_KEY:}"
+model = "..."                       # LLM_OPENAI_MODEL (required for this provider)
+base-url = "${OPENAI_BASE_URL:https://api.openai.com/v1}"
+```
+
+For example, to run against a local Ollama model:
+
+```bash
+LLM_PROVIDER=openai OPENAI_BASE_URL=http://localhost:11434/v1 LLM_OPENAI_MODEL=qwen3 pyronaut dev
+```
+
+To add another provider, implement `LlmClient` in a new module and annotate it with `@Singleton` and `@Requires(property="llm.provider", value="<name>")`.
 
 ---
 
 ## Tech Stack
 
-- **Runtime & Language:** Java 25 (OpenJDK 25) with virtual threads
-- **Backend Framework:** Micronaut 5.2.0 (Netty HTTP server, Serde JSON, Project Reactor)
-- **Agentic AI:** LangChain4j `1.20.0-beta30` (`langchain4j-agentic`, `langchain4j-google-genai`)
-- **LLM:** Google Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`)
-- **Cloud Infrastructure:** Google Cloud Run (Serverless build-less container execution) & Google Secret Manager
-- **Automation:** Gradle 9.6 + `just` task runner
+- **Runtime & Language:** Python 3.13 on GraalPy, hosted on a GraalVM JDK 25
+- **Framework:** [Pyronaut](https://pyronaut.io) 0.0.10 / Micronaut 5.2 (Netty HTTP server and client, Serialization, Project Reactor, asyncio bridge)
+- **LLM:** Google Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`) by default, swappable via `LlmClient`
+- **Testing:** pytest through `pyronaut test` with `MicronautTest` fixtures and `requests.with_context`
+- **Cloud Infrastructure:** Google Cloud Run & Google Secret Manager
+- **Automation:** `pyronaut` CLI + `just` task runner
 
 ---
 
 ## Prerequisites
 
-- **JDK 25** (e.g. installed via [SDKMAN!](https://sdkman.io/)): `sdk install java 25-tem`
-- **Gemini API Key:** from [Google AI Studio](https://aistudio.google.com/)
+- **Pyronaut CLI** (Python 3.10+ to install): `python3 -m pip install --upgrade pyronaut`, then `pyronaut setup`. Setup provisions the GraalVM JDK and GraalPy.
+- **Gemini API Key:** from [Google AI Studio](https://aistudio.google.com/). Only needed to run the app with the default backend; tests don't need it.
 - **`just`** (optional, recommended for quick commands): `brew install just`
+- **`uv`** (optional, used by `just fetch`): `brew install uv`
 - **Google Cloud SDK (`gcloud`)** (for deployment): `brew install --cask google-cloud-sdk`
 
 ---
@@ -117,13 +160,13 @@ export GEMINI_API_KEY="your-gemini-api-key"
 ### Using `just` (Recommended)
 
 ```bash
-# Run the application locally (port 8080)
-just run
+# Run the application locally with live reload (port 8080)
+just dev
 
 # Run all unit and integration test suites
 just test
 
-# Package shadow fat JAR and stage for deployment
+# Package the runnable fat JAR
 just build
 
 # Fetch the latest Devoxx BE 2026 schedule from CFP API
@@ -133,20 +176,13 @@ just fetch
 just
 ```
 
-### Using `./gradlew`
+### Using `pyronaut`
 
 ```bash
-# Run locally
-./gradlew run
-
-# Run tests
-./gradlew test
-
-# Build fat JAR
-./gradlew shadowJar
-
-# Fetch latest schedule from CFP API
-./gradlew fetchSchedule
+pyronaut install   # resolve dependencies, create the GraalPy .venv, generate IDE stubs
+pyronaut dev       # run with live reload
+pyronaut test      # run the pytest suite
+pyronaut build --jar && java -jar dist/dvxaisched-0.1.0.jar
 ```
 
 Once started, open your browser:
@@ -156,18 +192,28 @@ Once started, open your browser:
 
 ---
 
-## Fetching Latest Conference Schedules (`fetchSchedule`)
+## Testing
 
-The application embeds the official Devoxx Belgium 2026 dataset in [`src/main/resources/devoxx-be-2026.json`](file:///Users/glaforge/Projects/dvxaisched/src/main/resources/devoxx-be-2026.json).
+`pyronaut test` runs the pytest suite in `tests/` inside the application's runtime. `tests-config/application-test.toml` selects `llm.provider = "fake"`, so:
 
-A custom Gradle task queries the public Devoxx CFP REST API (`https://dvbe26.cfp.dev/api/public`), normalizes timezones (`Europe/Brussels`), merges speaker bios and full abstracts, sorts talks chronologically, and updates the local resources:
+- The full pipeline (guardrail, five concurrent day planners, de-confliction, fallbacks, SSE streaming, alternatives, caching and rate limiting) is exercised deterministically, offline and without an API key.
+- Failure modes are injected with `fake-llm.*` properties per test module, for example `fake-llm.fail-tasks = "plan-day"` or `fake-llm.fail-first-attempts = 1`.
+- The real `GeminiLlmClient` and `OpenAiCompatibleLlmClient` are tested over HTTP against mock Gemini / Chat Completions endpoints served by the application under test (`tests/mock_llm_api.py`).
+
+---
+
+## Fetching Latest Conference Schedules
+
+The application embeds the official Devoxx Belgium 2026 dataset in [`assets/devoxx-be-2026.json`](assets/devoxx-be-2026.json).
+
+[`scripts/fetch_schedule.py`](scripts/fetch_schedule.py) queries the public Devoxx CFP REST API (`https://dvbe26.cfp.dev/api/public`), normalizes timezones (`Europe/Brussels`), merges speaker bios and full abstracts, sorts talks chronologically, and updates the dataset:
 
 ```bash
 # Via just
 just fetch
 
-# Via Gradle
-./gradlew fetchSchedule
+# Directly
+uv run --no-project --script scripts/fetch_schedule.py
 
 # Or fetch for a specific event slug (e.g. dvbe25)
 just fetch dvbe25
@@ -177,7 +223,7 @@ just fetch dvbe25
 
 ## Deployment to Google Cloud Run
 
-The application is deployed to Google Cloud Run using the **build-less Java 25** source deployment approach (`google-24/java25`), which avoids Cloud Build overhead and completes in ~15 seconds.
+`just deploy` builds the fat JAR and deploys it from source. Cloud Build packages the JAR with the [`Dockerfile`](Dockerfile), which runs it on a GraalVM JDK 25 image so the embedded GraalPy runtime is JIT-compiled.
 
 ### Deploying via `just`
 
@@ -195,27 +241,24 @@ just project=YOUR_PROJECT_ID region=YOUR_REGION logs
 ### Manual Deployment via `gcloud`
 
 ```bash
-# 1. Package fat JAR into build-less staging directory
-./gradlew shadowJar
-mkdir -p build/run && cp build/libs/dvxaisched-0.1-all.jar build/run/application.jar
+# 1. Package the fat JAR
+pyronaut build --jar
 
-# 2. Deploy to Cloud Run
-gcloud beta run deploy dvxaisched \
-    --source=build/run \
-    --base-image=google-24/java25 \
+# 2. Deploy to Cloud Run (builds the Dockerfile with Cloud Build)
+gcloud run deploy dvxaisched \
+    --source=. \
     --region=YOUR_REGION \
     --project=YOUR_PROJECT_ID \
-    --no-build \
     --set-secrets=GEMINI_API_KEY=YOUR_SECRET_NAME:latest \
-    --set-env-vars=MICRONAUT_SERVER_PORT=8080 \
     --memory=2Gi \
     --cpu=2 \
     --allow-unauthenticated \
     --quiet
 ```
 
----
+Alternatively, `pyronaut build --jvm --docker` (`just docker`) builds a container image with Pyronaut's own packager.
 
+---
 
 ## License
 
@@ -226,5 +269,3 @@ This project is licensed under the [Apache License, Version 2.0](LICENSE).
 ## Disclaimer
 
 This is not an official Google project. It is not an officially supported Google product.
-
-

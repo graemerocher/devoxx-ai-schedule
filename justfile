@@ -23,7 +23,6 @@
 project     := env_var_or_default("GOOGLE_CLOUD_PROJECT", "genai-java-demos")
 region      := env_var_or_default("CLOUD_RUN_REGION", "europe-west1")
 service     := env_var_or_default("CLOUD_RUN_SERVICE", "dvxaisched")
-base_image  := env_var_or_default("CLOUD_RUN_BASE_IMAGE", "google-24/java25")
 memory      := env_var_or_default("CLOUD_RUN_MEMORY", "2Gi")
 cpu         := env_var_or_default("CLOUD_RUN_CPU", "2")
 secret      := env_var_or_default("CLOUD_RUN_SECRET", "GEMINI_API_KEY=DEVOXX_GEMINI_API_KEY:latest")
@@ -37,45 +36,52 @@ event_slug  := env_var_or_default("DEVOXX_EVENT_SLUG", "dvbe26")
 default:
     @just --list
 
-# Run all unit and integration test suites
+# Resolve Java/Python dependencies and generate editor stubs
+install:
+    pyronaut install
+
+# Run all unit and integration test suites (no API key needed: uses a fake LLM)
 test:
-    ./gradlew test
+    pyronaut test
 
-# Run test suite and generate JaCoCo code coverage reports
-coverage:
-    ./gradlew test jacocoTestReport
+# Run the application locally with live reload (port 8080)
+dev:
+    pyronaut dev
 
-# Run the Micronaut application locally
+# Run the application locally without live reload
 run:
-    ./gradlew run
+    pyronaut run
+
+# Validate application configuration for production
+validate:
+    pyronaut validate-config --scenario production
 
 # Fetch the latest official schedule from the CFP API and update resources
 fetch-schedule slug=event_slug:
-    ./gradlew fetchSchedule -PeventSlug={{slug}}
+    uv run --no-project --script scripts/fetch_schedule.py {{slug}}
 
 alias fetch := fetch-schedule
 
-# Package the shadow fat JAR and stage it for Cloud Run build-less deployment
+# Package the runnable fat JAR (dist/dvxaisched-0.1.0.jar)
 build:
-    ./gradlew shadowJar
-    mkdir -p build/run
-    cp build/libs/dvxaisched-0.1-all.jar build/run/application.jar
+    pyronaut build --jar
 
-# Clean build artifacts and staging directories
+# Build a JVM container image with Pyronaut's packager
+docker:
+    pyronaut build --jvm --docker
+
+# Clean generated Pyronaut state and build artifacts
 clean:
-    ./gradlew clean
-    rm -rf build/run
+    pyronaut clean
+    rm -rf dist
 
-# Build and deploy the service to Google Cloud Run (build-less Java 25)
+# Build the fat JAR and deploy it to Google Cloud Run (GraalVM JDK container)
 deploy: build
-    gcloud beta run deploy {{service}} \
-        --source=build/run \
-        --base-image={{base_image}} \
+    gcloud run deploy {{service}} \
+        --source=. \
         --region={{region}} \
         --project={{project}} \
-        --no-build \
         --set-secrets={{secret}} \
-        --set-env-vars=MICRONAUT_SERVER_PORT=8080 \
         --memory={{memory}} \
         --cpu={{cpu}} \
         --max-instances={{max_instances}} \
