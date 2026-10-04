@@ -54,7 +54,7 @@ daemon = false
 engine = "pytest"
 
 [tool.pyronaut.ide-stubs]
-packages = ["io.micronaut", "jakarta", "reactor.core.publisher"]
+packages = ["io.micronaut", "jakarta", "dev.langchain4j"]
 
 [tool.pyronaut.validation]
 enabled = true
@@ -72,7 +72,6 @@ runtime = [
   # it, but `pyronaut test` and packaged builds otherwise fall back to a loop
   # that cannot await Netty HTTP client calls or use run_in_executor.
   "io.micronaut:micronaut-context-python-netty",
-  "io.micronaut.reactor:micronaut-reactor",
   # LangChain4j AI services and agentic workflows
   "io.micronaut.langchain4j:micronaut-langchain4j-core",
   "io.micronaut.langchain4j:micronaut-langchain4j-agentic",

@@ -81,7 +81,8 @@ flowchart TD
 
 ### 6. Live Observability & Streaming SSE
 - Implements LangChain4j's `AgentListener` (`afterAgentInvocation`, `beforeAgentToolExecution`, `afterAgentToolExecution`) in Python and attaches it to every agent builder with a `BeanCreatedEventListener[AgentBuilder]`.
-- Each request's id travels in the `AgenticScope`. Listener events, including those from the parallel workers' threads, are routed back to that request and streamed as Server-Sent Events (`/api/schedule/stream`) that drive the animated status cards in the web frontend.
+- Each request's id travels in the `AgenticScope`. Listener events, including those from the parallel workers' threads, are routed back to that request through an `asyncio.Queue`.
+- `/api/schedule/stream` is an async generator route (`async def … -> AsyncIterator[Event[WorkflowProgressEvent]]`). Micronaut streams each yielded Server-Sent Event as the client requests it, and a client disconnect closes the generator, which cancels the running workflow. The events drive the animated status cards in the web frontend.
 
 ### 7. Structured Outputs with Micronaut JSON Schema
 - The agents' output types (`ValidationResult`, `PlannedDay`, `PlannedSchedule`, `TalkAlternativesResult`, …) are `@JsonSchema` dataclasses. Micronaut JSON Schema generates their schemas at compile time, using the docstrings as property descriptions and marking non-nullable properties as required (`strictMode`).
@@ -138,7 +139,7 @@ No agent code changes. If several chat models are configured, pick one per agent
 ## Tech Stack
 
 - **Runtime & Language:** Python 3.13 on GraalPy, hosted on a GraalVM JDK 25
-- **Framework:** [Pyronaut](https://pyronaut.io) 0.0.10 / Micronaut 5.2 (Netty HTTP server, Serialization, Project Reactor, asyncio bridge)
+- **Framework:** [Pyronaut](https://pyronaut.io) 0.0.10 / Micronaut 5.2 (Netty HTTP server, Serialization, asyncio bridge with async generator streaming)
 - **Agentic AI:** LangChain4j 1.20 (`langchain4j-agentic`) via Micronaut LangChain4j 2.3
 - **Structured outputs:** Micronaut JSON Schema 2.3 (compile-time `@JsonSchema`)
 - **Caching:** Micronaut Cache with Caffeine (`@Cacheable`)

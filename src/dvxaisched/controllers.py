@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from dev.langchain4j.model.chat import ChatModel
@@ -27,8 +27,6 @@ from java.util.concurrent import Semaphore
 from micronaut.http import HttpRequest, HttpResponse, HttpStatus, MediaType
 from micronaut.http.annotation import Body, Controller, Get, Post, QueryValue
 from micronaut.http.sse import Event
-from org.reactivestreams import Publisher
-from reactor.core.publisher import Flux, Sinks
 
 from .agent_listeners import AGENT2
 from .cache import ScheduleCache, normalize_key, rejected_from_error
@@ -163,11 +161,19 @@ class ScheduleController:
         self,
         interests: Annotated[str, QueryValue(defaultValue="")],
         http_request: HttpRequest,
-    ) -> Publisher:
+    ) -> AsyncIterator[Event[WorkflowProgressEvent]]:
+        """Streams the workflow's progress as server-sent events.
+
+        An async generator route: Micronaut streams each yielded event once the
+        client requests it, and a client disconnect closes the generator (which
+        cancels the running workflow in the ``finally`` block).
+        """
         if not interests or not interests.strip():
-            return Flux.just(Event.of(progress_rejected("Interests cannot be empty.", 0)))
+            yield Event.of(progress_rejected("Interests cannot be empty.", 0))
+            return
         if len(interests) > MAX_INTERESTS_LENGTH:
-            return Flux.just(Event.of(progress_rejected(TOO_LONG_MESSAGE, 0)))
+            yield Event.of(progress_rejected(TOO_LONG_MESSAGE, 0))
+            return
 
         clean_interests = interests.strip()
         LOG.info("Received streaming schedule request: '%s'", sanitize_for_log(clean_interests))
@@ -178,32 +184,32 @@ class ScheduleController:
         decision = self.rate_limiter.check_rate_limit(session_id, client_ip)
         if not decision.allowed:
             LOG.warning("Rate limit rejected streaming request for IP %s (session %s): %s", client_ip, session_id, decision.reason)
-            return Flux.just(Event.of(progress_rejected(_rate_limit_message(decision), 0)))
+            yield Event.of(progress_rejected(_rate_limit_message(decision), 0))
+            return
 
         # 2. Check the schedule cache
         cache_key = normalize_key(clean_interests)
         cached = self.schedule_cache.get(cache_key)
         if cached is not None:
             LOG.info("Serving streaming schedule from cache for query: '%s'", sanitize_for_log(clean_interests))
-            return Flux.just(
-                Event.of(WorkflowProgressEvent("agent1_done", GUARDRAIL_AGENT, f"Query verified (cache hit): {clean_interests}", 5)),
-                Event.of(WorkflowProgressEvent("agent2_done", AGENT2, "Loaded personalized timetable from cache.", 10)),
-                Event.of(progress_complete(cached, 15)),
-            )
+            yield Event.of(WorkflowProgressEvent("agent1_done", GUARDRAIL_AGENT, f"Query verified (cache hit): {clean_interests}", 5))
+            yield Event.of(WorkflowProgressEvent("agent2_done", AGENT2, "Loaded personalized timetable from cache.", 10))
+            yield Event.of(progress_complete(cached, 15))
+            return
 
         # 3. Concurrency limiter & streaming execution on the request's event loop
         if not self.workflow_limiter.tryAcquire():
             LOG.warning("Concurrently running schedule workflows limit reached (%d); rejecting request", MAX_CONCURRENT_WORKFLOWS)
-            return Flux.just(Event.of(progress_rejected(BUSY_MESSAGE, 0)))
+            yield Event.of(progress_rejected(BUSY_MESSAGE, 0))
+            return
 
-        sink = Sinks.many().unicast().onBackpressureBuffer()
-        # Progress events also arrive from the parallel day workers' threads;
-        # Reactor sinks require serialized emissions.
-        emit_lock = threading.Lock()
+        # Progress events also arrive from the parallel day workers' threads, so
+        # they are handed to this generator's loop through a queue.
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue[WorkflowProgressEvent | None] = asyncio.Queue()
 
-        def emit(event: WorkflowProgressEvent) -> None:
-            with emit_lock:
-                sink.tryEmitNext(Event.of(event))
+        def emit(event: WorkflowProgressEvent | None) -> None:
+            loop.call_soon_threadsafe(events.put_nowait, event)
 
         async def run_workflow() -> None:
             try:
@@ -213,20 +219,22 @@ class ScheduleController:
                 LOG.info("Streaming schedule request cancelled by client")
                 raise
             except Exception as e:
-                if rejected_from_error(e) is not None:
-                    return
-                LOG.error("Error streaming schedule: %s", e)
-                emit(progress_rejected(
-                    "An unexpected error occurred while curating the schedule. Please try again with different topics.", 0
-                ))
+                if rejected_from_error(e) is None:
+                    LOG.error("Error streaming schedule: %s", e)
+                    emit(progress_rejected(
+                        "An unexpected error occurred while curating the schedule. Please try again with different topics.", 0
+                    ))
             finally:
                 self.workflow_limiter.release()
-                with emit_lock:
-                    sink.tryEmitComplete()
+                emit(None)  # end of stream
 
-        loop = asyncio.get_running_loop()
         task = loop.create_task(run_workflow())
-        return sink.asFlux().doOnCancel(lambda: loop.call_soon_threadsafe(task.cancel))
+        try:
+            while (event := await events.get()) is not None:
+                yield Event.of(event)
+        finally:
+            if not task.done():
+                task.cancel()
 
     @Get(uri="/tracks", produces=MediaType.APPLICATION_JSON)
     def get_tracks(self) -> list[str]:
