@@ -210,7 +210,7 @@ Once started, open your browser:
 - The real agents, prompts, structured outputs, tool calling, the parallel mapper, retries, fallbacks, SSE streaming, alternatives, caching and rate limiting are all exercised deterministically, offline and without an API key.
 - The fake records the JSON schema of every request, so the tests also assert that the compile-time Micronaut JSON Schema is the one sent to the model.
 - Failure modes and latency are injected per test module with `fake-llm.*` properties (bound to a `@ConfigurationProperties` class), for example `fake-llm.fail-tasks = "plan-day"` or `fake-llm.fail-first-attempts = 1`.
-- `test_gemini_chat_model.py` exercises the real Micronaut LangChain4j Gemini `ChatModel` over HTTP against a mock Gemini API served by the application under test (`tests/mock_gemini_api.py`).
+- `test_gemini_chat_model.py` exercises the real Micronaut LangChain4j Gemini `ChatModel` over HTTP against a mock Gemini API served by the application under test (`tests/mock_gemini_routes.py`).
 
 ## Fetching Latest Conference Schedules
 

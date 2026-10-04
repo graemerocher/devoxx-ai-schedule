@@ -23,9 +23,12 @@ import time
 from dataclasses import dataclass
 
 from jakarta.inject import Singleton
+from java.util.concurrent import Semaphore
 from micronaut.context.annotation import ConfigurationProperties
 
 LOG = logging.getLogger(__name__)
+
+MAX_CONCURRENT_WORKFLOWS = 10
 
 
 @dataclass
@@ -169,3 +172,21 @@ class RateLimiterService(RateLimiter):
             config.ip_limit,
             config.ip_window_seconds,
         )
+
+
+@Singleton
+class WorkflowLimiter:
+    """Bounds the number of schedule workflows running at the same time.
+
+    A Java semaphore held by a singleton is shared by every Netty event loop and
+    GraalPy context serving requests.
+    """
+
+    def __init__(self):
+        self._semaphore = Semaphore(MAX_CONCURRENT_WORKFLOWS)
+
+    def try_acquire(self) -> bool:
+        return self._semaphore.tryAcquire()
+
+    def release(self) -> None:
+        self._semaphore.release()

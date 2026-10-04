@@ -1,0 +1,291 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""HTTP API of the schedule curator.
+
+A classless route module: ``Controller("/api")`` declares the prefix and the
+collaborators are injected as module attributes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+from dev.langchain4j.model.chat import ChatModel
+from jakarta.inject import Inject
+from micronaut.http import HttpRequest, HttpResponse, HttpStatus, MediaType
+from micronaut.http.annotation import Body, Controller, Get, Post, QueryValue
+from micronaut.http.sse import Event
+
+from .agent_listeners import AGENT2
+from .cache import ScheduleCache, normalize_key, rejected_from_error
+from .client_ip import resolve_client_ip, resolve_session_id
+from .conference import DevoxxConferenceService
+from .models import (
+    GUARDRAIL_AGENT,
+    ConferenceTalk,
+    ScheduleRequest,
+    TalkAlternativeRequest,
+    WorkflowProgressEvent,
+    empty_alternatives,
+    progress_complete,
+    progress_rejected,
+    rejected_schedule,
+)
+from .rate_limiter import MAX_CONCURRENT_WORKFLOWS, RateLimitDecision, RateLimiterService, WorkflowLimiter
+from .workflow import MAX_INTERESTS_LENGTH, DevoxxAgentWorkflowService, sanitize_for_log
+
+Controller("/api")
+
+workflow_service: Annotated[DevoxxAgentWorkflowService, Inject]
+conference_service: Annotated[DevoxxConferenceService, Inject]
+rate_limiter: Annotated[RateLimiterService, Inject]
+workflow_limiter: Annotated[WorkflowLimiter, Inject]
+schedule_cache: Annotated[ScheduleCache, Inject]
+chat_model: Annotated[ChatModel, Inject]
+
+LOG = logging.getLogger(__name__)
+
+BUSY_MESSAGE = (
+    "The scheduling service is currently busy handling maximum concurrent requests. Please retry in a few moments."
+)
+TOO_LONG_MESSAGE = f"Input exceeds maximum allowed length of {MAX_INTERESTS_LENGTH} characters."
+
+SAMPLE_INTERESTS: list[dict[str, str]] = [
+    {
+        "title": "AI Agents & GenAI",
+        "badge": "Agentic",
+        "prompt": "I'm interested in AI agents, Generative AI, LLM evaluation, LangChain4j, and loop engineering.",
+    },
+    {
+        "title": "Java Language & JVM",
+        "badge": "Java",
+        "prompt": "A schedule focused on the Java language, latest features, Project Loom virtual threads, Valhalla, Amber, and best practices.",
+    },
+    {
+        "title": "Mind the Geek & Quirky",
+        "badge": "Geeky",
+        "prompt": "A geeky agenda with fun, entertaining, surprising topics like robotics, Raspberry Pi, game engines, and space computing.",
+    },
+    {
+        "title": "Architecture & Modernization",
+        "badge": "Architecture",
+        "prompt": "Modern enterprise architecture, modular monoliths, distributed systems, event-driven design, and guardrails.",
+    },
+    {
+        "title": "Cloud Native & Kubernetes",
+        "badge": "Cloud",
+        "prompt": "Cloud-native Java, Kubernetes platforms, container hardening, vector databases, and GPU infrastructure.",
+    },
+]
+
+
+def _rate_limit_message(decision: RateLimitDecision) -> str:
+    return f"Rate limit exceeded. {decision.reason} Please retry in {decision.retry_after_seconds} seconds."
+
+
+@Post(uri="/schedule", consumes=MediaType.APPLICATION_JSON, produces=MediaType.APPLICATION_JSON)
+async def generate_schedule(request: Annotated[ScheduleRequest, Body], http_request: HttpRequest) -> HttpResponse:
+    if request is None or not request.interests or not request.interests.strip():
+        return HttpResponse.badRequest(rejected_schedule("Interests cannot be empty."))
+    if len(request.interests) > MAX_INTERESTS_LENGTH:
+        return HttpResponse.badRequest(rejected_schedule(TOO_LONG_MESSAGE))
+
+    interests = request.interests.strip()
+    LOG.info("Received schedule generation request: '%s'", sanitize_for_log(interests))
+
+    # 1. Check rate limit (per session and IP aggregate)
+    session_id = resolve_session_id(http_request)
+    client_ip = resolve_client_ip(http_request)
+    decision = rate_limiter.check_rate_limit(session_id, client_ip)
+    if not decision.allowed:
+        LOG.warning("Rate limit rejected schedule request for IP %s (session %s): %s", client_ip, session_id, decision.reason)
+        return (
+            HttpResponse.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", str(decision.retry_after_seconds))
+            .body(rejected_schedule(_rate_limit_message(decision)))
+        )
+
+    # 2. Check the schedule cache
+    cache_key = normalize_key(interests)
+    cached = schedule_cache.get(cache_key)
+    if cached is not None:
+        LOG.info("Serving schedule from cache for query: '%s'", sanitize_for_log(interests))
+        return HttpResponse.ok(cached)
+
+    # 3. Concurrency limiter & workflow execution
+    if not workflow_limiter.try_acquire():
+        LOG.warning("Concurrently running schedule workflows limit reached (%d); rejecting request", MAX_CONCURRENT_WORKFLOWS)
+        return HttpResponse.status(HttpStatus.SERVICE_UNAVAILABLE).body(rejected_schedule(BUSY_MESSAGE))
+    try:
+        return HttpResponse.ok(await schedule_cache.schedule(cache_key, interests, None))
+    except Exception as e:
+        rejected = rejected_from_error(e)
+        if rejected is None:
+            raise
+        return HttpResponse.ok(rejected)
+    finally:
+        workflow_limiter.release()
+
+
+@Get(uri="/schedule/stream", produces=MediaType.TEXT_EVENT_STREAM)
+async def stream_schedule(
+    interests: Annotated[str, QueryValue(defaultValue="")],
+    http_request: HttpRequest,
+) -> AsyncIterator[Event[WorkflowProgressEvent]]:
+    """Streams the workflow's progress as server-sent events.
+
+    An async generator route: Micronaut streams each yielded event once the
+    client requests it, and a client disconnect closes the generator (which
+    cancels the running workflow in the ``finally`` block).
+    """
+    if not interests or not interests.strip():
+        yield Event.of(progress_rejected("Interests cannot be empty.", 0))
+        return
+    if len(interests) > MAX_INTERESTS_LENGTH:
+        yield Event.of(progress_rejected(TOO_LONG_MESSAGE, 0))
+        return
+
+    clean_interests = interests.strip()
+    LOG.info("Received streaming schedule request: '%s'", sanitize_for_log(clean_interests))
+
+    # 1. Check rate limit (per session and IP aggregate)
+    session_id = resolve_session_id(http_request)
+    client_ip = resolve_client_ip(http_request)
+    decision = rate_limiter.check_rate_limit(session_id, client_ip)
+    if not decision.allowed:
+        LOG.warning("Rate limit rejected streaming request for IP %s (session %s): %s", client_ip, session_id, decision.reason)
+        yield Event.of(progress_rejected(_rate_limit_message(decision), 0))
+        return
+
+    # 2. Check the schedule cache
+    cache_key = normalize_key(clean_interests)
+    cached = schedule_cache.get(cache_key)
+    if cached is not None:
+        LOG.info("Serving streaming schedule from cache for query: '%s'", sanitize_for_log(clean_interests))
+        yield Event.of(WorkflowProgressEvent("agent1_done", GUARDRAIL_AGENT, f"Query verified (cache hit): {clean_interests}", 5))
+        yield Event.of(WorkflowProgressEvent("agent2_done", AGENT2, "Loaded personalized timetable from cache.", 10))
+        yield Event.of(progress_complete(cached, 15))
+        return
+
+    # 3. Concurrency limiter & streaming execution on the request's event loop
+    if not workflow_limiter.try_acquire():
+        LOG.warning("Concurrently running schedule workflows limit reached (%d); rejecting request", MAX_CONCURRENT_WORKFLOWS)
+        yield Event.of(progress_rejected(BUSY_MESSAGE, 0))
+        return
+
+    # Progress events also arrive from the parallel day workers' threads, so
+    # they are handed to this generator's loop through a queue.
+    loop = asyncio.get_running_loop()
+    events: asyncio.Queue[WorkflowProgressEvent | None] = asyncio.Queue()
+
+    def emit(event: WorkflowProgressEvent | None) -> None:
+        loop.call_soon_threadsafe(events.put_nowait, event)
+
+    async def run_workflow() -> None:
+        try:
+            # Progress (including the rejection event) is streamed by the workflow itself
+            await schedule_cache.schedule(cache_key, clean_interests, emit)
+        except asyncio.CancelledError:
+            LOG.info("Streaming schedule request cancelled by client")
+            raise
+        except Exception as e:
+            if rejected_from_error(e) is None:
+                LOG.error("Error streaming schedule: %s", e)
+                emit(progress_rejected(
+                    "An unexpected error occurred while curating the schedule. Please try again with different topics.", 0
+                ))
+        finally:
+            workflow_limiter.release()
+            emit(None)  # end of stream
+
+    task = loop.create_task(run_workflow())
+    try:
+        while (event := await events.get()) is not None:
+            yield Event.of(event)
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+@Get(uri="/tracks", produces=MediaType.APPLICATION_JSON)
+def get_tracks() -> list[str]:
+    return conference_service.get_all_tracks()
+
+
+@Get(uri="/talks", produces=MediaType.APPLICATION_JSON)
+def get_talks(
+    q: Annotated[str, QueryValue(defaultValue="")],
+    day: Annotated[str, QueryValue(defaultValue="")],
+    limit: Annotated[int, QueryValue(defaultValue="20")],
+) -> list[ConferenceTalk]:
+    safe_limit = max(1, min(limit, 100))
+    return conference_service.search_talks(q, day, safe_limit)
+
+
+@Get(uri="/talks/{id}", produces=MediaType.APPLICATION_JSON)
+def get_talk_by_id(id: int) -> ConferenceTalk | None:
+    return conference_service.get_talk_by_id(id)
+
+
+@Post(uri="/schedule/alternatives", consumes=MediaType.APPLICATION_JSON, produces=MediaType.APPLICATION_JSON)
+async def get_alternatives(
+    request: Annotated[TalkAlternativeRequest, Body], http_request: HttpRequest
+) -> HttpResponse:
+    if request is None or request.talk_id <= 0:
+        return HttpResponse.badRequest(empty_alternatives(0, "Invalid talk ID."))
+
+    client_ip = resolve_client_ip(http_request)
+    session_id = resolve_session_id(http_request)
+    decision = rate_limiter.check_rate_limit(session_id, client_ip)
+    if not decision.allowed:
+        LOG.warning("Rate limit rejected alternatives request for IP %s (session %s): %s", client_ip, session_id, decision.reason)
+        return (
+            HttpResponse.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", str(decision.retry_after_seconds))
+            .body(empty_alternatives(request.talk_id, _rate_limit_message(decision)))
+        )
+
+    LOG.info("Finding alternatives for talk ID %d with interests: '%s'", request.talk_id, sanitize_for_log(request.interests))
+    return HttpResponse.ok(await workflow_service.find_alternatives(request.interests, request.talk_id))
+
+
+@Get(uri="/sample-interests", produces=MediaType.APPLICATION_JSON)
+def get_sample_interests() -> list[dict[str, str]]:
+    return SAMPLE_INTERESTS
+
+
+@Get(uri="/health", produces=MediaType.APPLICATION_JSON)
+def health() -> dict[str, object]:
+    return {
+        "status": "UP",
+        "conference": "Devoxx Belgium 2026",
+        "dates": "October 5-9, 2026",
+        "venue": "Kinepolis, Antwerp",
+        "totalTalksLoaded": len(conference_service.talks),
+        "model": model_name(),
+    }
+
+
+def model_name() -> str:
+    try:
+        name = chat_model.defaultRequestParameters().modelName()
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    return "unknown"

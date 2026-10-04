@@ -22,7 +22,6 @@ from dev.langchain4j.model.chat.response import ChatResponse
 from jakarta.inject import Singleton
 from java.util import List
 from micronaut.context.annotation import ConfigurationProperties, Primary, Requires
-from micronaut.http.annotation import Controller, Delete, Get
 
 TASK_VALIDATE = "validate-interests"
 TASK_PLAN_DAY = "plan-day"
@@ -199,21 +198,3 @@ class FakeChatModel(ChatModel):
         finally:
             with self._lock:
                 self._in_flight -= 1
-
-
-@Controller("/test/fake-llm")
-@Requires(env="test")
-@Requires(property="langchain4j.google-ai-gemini.enabled", value="false")
-class FakeLlmController:
-    def __init__(self, chat_model: ChatModel):
-        # The bean is decorated by dvxaisched.structured_output.SchemaAwareChatModel
-        self.fake = getattr(chat_model, "delegate", chat_model)
-
-    @Get("/stats")
-    def stats(self) -> dict[str, Any]:
-        return self.fake.stats()
-
-    @Delete("/stats")
-    def reset(self) -> dict[str, bool]:
-        self.fake.reset()
-        return {"reset": True}
