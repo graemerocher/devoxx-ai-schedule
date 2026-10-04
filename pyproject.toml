@@ -58,6 +58,9 @@ packages = ["io.micronaut", "jakarta", "reactor.core.publisher"]
 
 [tool.pyronaut.validation]
 enabled = true
+# `micronaut.jsonschema.*` (application.toml) are annotation processor
+# options, not runtime properties, so the runtime configuration schema rejects them.
+suppressions = ["micronaut.jsonschema"]
 
 [tool.pyronaut.dependencies]
 runtime = [
@@ -70,10 +73,21 @@ runtime = [
   # that cannot await Netty HTTP client calls or use run_in_executor.
   "io.micronaut:micronaut-context-python-netty",
   "io.micronaut.reactor:micronaut-reactor",
+  # LangChain4j AI services and agentic workflows
+  "io.micronaut.langchain4j:micronaut-langchain4j-core",
+  "io.micronaut.langchain4j:micronaut-langchain4j-agentic",
+  # Chat model provider: Gemini by default. Swap (or add) another provider
+  # module such as micronaut-langchain4j-openai or -ollama to change backend.
+  "io.micronaut.langchain4j:micronaut-langchain4j-googleai-gemini",
+  # Compile-time JSON schemas of the agents' structured outputs
+  "io.micronaut.jsonschema:micronaut-json-schema-annotations",
+  "io.micronaut.jsonschema:micronaut-json-schema-utils",
 ]
 build = [
   "io.micronaut.serde:micronaut-serde-processor",
   "io.micronaut:micronaut-http-validation",
+  "io.micronaut.langchain4j:micronaut-langchain4j-processor",
+  "io.micronaut.jsonschema:micronaut-json-schema-processor",
 ]
 test = [
   "io.micronaut.pyronaut:micronaut-pyronaut-pytest",

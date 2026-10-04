@@ -1,11 +1,7 @@
-# Tests run against a deterministic fake LLM backend (tests/fake_llm.py) so no
-# API key or network access is needed. Individual test modules switch to the
-# real Gemini / OpenAI-compatible clients pointed at mock endpoints.
-[llm]
-provider = "fake"
-
-[llm.gemini]
-api-key = "test-gemini-key"
+# Tests run against a deterministic fake ChatModel (tests/fake_chat_model.py)
+# instead of Gemini, so no API key or network access is needed.
+[langchain4j.google-ai-gemini]
+enabled = false
 
 [micronaut.server]
 port = -1

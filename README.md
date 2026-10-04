@@ -1,53 +1,51 @@
 # Devoxx Belgium 2026 AI Schedule Curator (`dvxaisched`)
 
-A Python application built with [Pyronaut](https://pyronaut.io), which runs Python on Micronaut and GraalPy. It uses an agentic LLM pipeline, by default backed by Google's **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`), to generate personalized, conflict-free 5-day schedules for [Devoxx Belgium 2026](https://devoxx.be) (October 5–9, 2026, Kinepolis Antwerp).
+A Python application built with [Pyronaut](https://pyronaut.io), which runs Python on Micronaut and GraalPy. It uses the **LangChain4j Agentic Framework** through [Micronaut LangChain4j](https://micronaut-projects.github.io/micronaut-langchain4j/latest/guide/) and Google's **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`) to generate personalized, conflict-free 5-day schedules for [Devoxx Belgium 2026](https://devoxx.be) (October 5–9, 2026, Kinepolis Antwerp).
 
-The LLM backend sits behind a small `LlmClient` abstraction. You can swap Gemini for any OpenAI-compatible API (OpenAI, Ollama, vLLM and others) through configuration, and the test suite runs against a deterministic fake backend, so no API key is needed.
+This is a Python port of the original Java 25 application. The agents are the same LangChain4j AI services and agentic workflows, declared as Python abstract classes. The structured-output JSON schemas are generated at compile time by [Micronaut JSON Schema](https://micronaut-projects.github.io/micronaut-json-schema/latest/guide/). Gemini is just the configured `ChatModel`, so it can be swapped for any other LangChain4j provider, and the test suite runs against a deterministic fake `ChatModel` with no API key.
 
 ---
 
 ## Architecture & Agent Structure
 
-The application is a resilient, multi-stage agentic pipeline written with Python `async`/`await`. Pyronaut runs coroutines on Micronaut's Netty event loop, so the five day planners run concurrently with `asyncio.gather`, without blocking threads.
+The application is a resilient, multi-stage agentic pipeline built with LangChain4j (`langchain4j-agentic`) via Micronaut LangChain4j (`@AgenticService`, `@AiService`).
 
 ```mermaid
 flowchart TD
     User(["Attendee Input"]) --> UI["Web Interface / SSE Stream"]
-    UI --> Controller["ScheduleController<br/>/api/schedule/stream"]
+    UI --> Controller["ScheduleController (async)<br/>/api/schedule/stream"]
 
-    subgraph Agentic_Pipeline ["DevoxxAgentWorkflowService (async)"]
-        Controller --> Agent1["Agent 1: InterestValidatorAgent<br/>Security & Guardrail"]
+    subgraph Agentic_Pipeline ["DevoxxAgentWorkflowService"]
+        Controller --> Scope["AgenticScope & AgentListener progress"]
+
+        Scope --> Agent1["Agent 1: InterestValidatorAgent<br/>Security & Guardrail"]
         Agent1 -- "Rejected" --> ShortCircuit["Short-circuit with polite explanation"]
 
         Agent1 -- "Validated" --> Partition["Devoxx Catalog Partitioning<br/>Pre-scores & filters 200 talks into 5 days"]
 
-        Partition --> Gather["asyncio.gather on the Netty event loop"]
+        Partition --> ParallelMapper["ParallelScheduleBuilderWorkflow<br/>@ParallelMapperAgent on the Micronaut IO executor"]
 
-        subgraph Parallel_Workers ["5 concurrent DayScheduleBuilderAgent calls"]
-            Gather --> DayMon["Day 1: Monday Optimizer"]
-            Gather --> DayTue["Day 2: Tuesday Optimizer"]
-            Gather --> DayWed["Day 3: Wednesday Optimizer"]
-            Gather --> DayThu["Day 4: Thursday Optimizer"]
-            Gather --> DayFri["Day 5: Friday Optimizer"]
+        subgraph Parallel_Workers ["5 Concurrent Gemini 3.5 Flash-Lite Workers"]
+            ParallelMapper --> DayMon["Day 1: Monday Optimizer"]
+            ParallelMapper --> DayTue["Day 2: Tuesday Optimizer"]
+            ParallelMapper --> DayWed["Day 3: Wednesday Optimizer"]
+            ParallelMapper --> DayThu["Day 4: Thursday Optimizer"]
+            ParallelMapper --> DayFri["Day 5: Friday Optimizer"]
         end
 
-        Parallel_Workers -. "Transient Error" .-> Retry["Per-day retry (max 2)"]
-        Retry -. "Retry" .-> Parallel_Workers
+        Parallel_Workers -. "Transient Error" .-> ErrorHandler["LangChain4j errorHandler<br/>ErrorRecoveryResult.retry"]
+        ErrorHandler -. "Retry (max 2)" .-> Parallel_Workers
 
-        Parallel_Workers -- "5 Day Schedules" --> Enrich["De-conflict, backfill & enrich with CFP abstracts"]
-        Parallel_Workers -. "Fatal Failure" .-> Fallback["Fallback: Monolithic ScheduleBuilderAgent"]
+        Parallel_Workers -- "5 Day Schedules" --> Enrich["Enrich with Full CFP Abstracts"]
+        Parallel_Workers -. "Fatal Failure" .-> Fallback["Fallback: Monolithic ScheduleBuilderAgent<br/>Equipped with DevoxxConferenceTools"]
         Fallback --> Enrich
     end
 
-    subgraph Backends ["LlmClient (llm.provider)"]
-        Gemini["GeminiLlmClient<br/>(default)"]
-        OpenAI["OpenAiCompatibleLlmClient"]
-        Fake["FakeLlmClient<br/>(tests)"]
-    end
-    Agentic_Pipeline -. "generate_json()" .-> Backends
+    Schemas["@JsonSchema output types<br/>(Micronaut JSON Schema, compile time)"] -. "structured output schema" .-> Model["ChatModel bean<br/>(Gemini by default)"]
+    Agentic_Pipeline -. "LangChain4j" .-> Model
 
     Enrich --> Result(["Conflict-Free 5-Day Agenda"])
-    Agentic_Pipeline -. "Live SSE Progress Events" .-> UI
+    Scope -. "Live SSE Progress Events" .-> UI
 ```
 
 ### 1. Agent 1: Guardrail & Validator (`InterestValidatorAgent`)
@@ -62,77 +60,84 @@ flowchart TD
 - Before any LLM call, the service scores the 200 official Devoxx Belgium sessions against the attendee's validated interests and keeps the best candidates.
 - Sessions are partitioned across the 5 conference days according to Devoxx formatting rules: Deep Dives and Labs on Mon/Tue; Keynotes, Lunch talks and Conference sessions on Wed/Thu/Fri.
 
-### 3. Agent 2: Parallel Day Optimizers (`DayScheduleBuilderAgent`)
+### 3. Agent 2: Parallel Day Mapper (`ParallelScheduleBuilderWorkflow`)
 - **Role:** Builds conflict-free daily agendas concurrently.
-- **Concurrency:** Five `async` agent calls are awaited together with `asyncio.gather`. Each call awaits Micronaut's non-blocking HTTP client, so all five model requests are in flight at once on the Netty event loop.
-- Each worker curates one conference day:
+- **Parallel mapper:** A declarative LangChain4j `@ParallelMapperAgent` maps `DayScheduleBuilderAgent` over the five day requests. Its builder is customised with a Micronaut `BeanCreatedEventListener` to run on Micronaut's IO executor (platform threads, since GraalPy cannot run Python on virtual threads).
+- The HTTP layer is `async`: each blocking agent invocation is handed to Micronaut's blocking executor with `run_in_executor`, keeping the Netty event loop free.
+- **Sub-agent (`DayScheduleBuilderAgent`):** 5 concurrent Gemini 3.5 Flash-Lite workers each curate a single conference day:
   - Selects 3 to 6 top sessions matching attendee interests.
   - Never picks overlapping time slots.
   - Writes a personalized rationale for each session.
 
-### 4. Resilient Error Handling
-- **Granular retries:** If one day worker fails (for example, a transient rate limit), only that day is retried, up to 2 times. The other days are kept, and each retry is reported to the live UI.
+### 4. Resilient Error Handling (`errorHandler`)
+- Configured with LangChain4j's native **`errorHandler`** on the parallel mapper builder (see `agent_listeners.py`).
+- **Granular retries:** If one day worker fails (for example, a transient rate limit), the handler returns **`ErrorRecoveryResult.retry()`** up to 2 times for that day. The other 4 completed days are kept.
+- **Progress visibility:** Each retry is reported to the live UI.
 - **Post-processing:** Any overlaps the model produced are removed, sparse days are backfilled from the catalog, and abstracts and URLs are always taken from the official dataset.
 
 ### 5. Multi-Tier Fallback Safety Net
-- **Tier 1:** The monolithic `ScheduleBuilderAgent` builds the whole week in a single call if the parallel stage fails.
+- **Tier 1:** If parallel mapping fails, the monolithic `ScheduleBuilderAgent` runs. It is equipped with `DevoxxConferenceTools`: `@Tool` methods for session search, tracks, daily schedules and favourites.
 - **Tier 2:** A deterministic catalog schedule is returned if the LLM is completely unreachable.
 
 ### 6. Live Observability & Streaming SSE
-- `/api/schedule/stream` returns a Reactor `Flux` of Server-Sent Events. The workflow runs as an asyncio task on the request's event loop and pushes progress events into a Reactor sink as each stage and each day completes. These events drive the animated status cards in the web frontend.
+- Implements LangChain4j's `AgentListener` (`afterAgentInvocation`, `beforeAgentToolExecution`, `afterAgentToolExecution`) in Python and attaches it to every agent builder with a `BeanCreatedEventListener[AgentBuilder]`.
+- Each request's id travels in the `AgenticScope`. Listener events, including those from the parallel workers' threads, are routed back to that request and streamed as Server-Sent Events (`/api/schedule/stream`) that drive the animated status cards in the web frontend.
 
-### 7. Interactive Slot Re-Curator (`TalkAlternativeAgent`)
+### 7. Structured Outputs with Micronaut JSON Schema
+- The agents' output types (`ValidationResult`, `PlannedDay`, `PlannedSchedule`, `TalkAlternativesResult`, …) are `@JsonSchema` dataclasses. Micronaut JSON Schema generates their schemas at compile time, using the docstrings as property descriptions and marking non-nullable properties as required (`strictMode`).
+- `SchemaAwareChatModel` decorates whichever `ChatModel` bean is configured. It sends those generated schemas as the structured-output response format, in place of the schema LangChain4j would derive by reflection.
+
+### 8. Interactive Slot Re-Curator (`TalkAlternativeAgent`)
 - **Role:** Lets attendees swap a talk they've already seen, or whose topic they know too well, for a compelling alternative.
 - **Workflow:**
   - Finds parallel sessions in other rooms for that exact time slot.
-  - The LLM evaluates the attendee's interests and picks the **top 3 alternatives** with personalized rationales. The call is bounded by a 6-second `asyncio.wait_for` timeout, and a deterministic ranking takes over if it fails.
+  - An `@AiService` evaluates the attendee's interests and picks the **top 3 alternatives** with personalized rationales. The call is bounded by a 6-second `asyncio.wait_for` timeout, and a deterministic ranking takes over if it fails.
   - The attendee picks a talk in a modal dialog. It replaces the original in place, and the ICS calendar and Markdown exports update automatically.
 
 ---
 
-## Swappable LLM Backends
+## Swappable Chat Model
 
-Agents never talk to a vendor SDK directly. Each agent builds an `LlmRequest` (task name, system prompt, user prompt and a JSON schema for the structured answer) and awaits `LlmClient.generate_json()`. The implementation is a Micronaut bean selected by `llm.provider`:
-
-| `llm.provider` | Bean | Notes |
-| --- | --- | --- |
-| `gemini` (default) | `GeminiLlmClient` | Generative Language REST API `models/{model}:generateContent` with `responseJsonSchema` structured output. |
-| `openai` | `OpenAiCompatibleLlmClient` | Any `POST {base}/chat/completions` server that supports `response_format: json_schema`: OpenAI, Ollama, vLLM, LM Studio and others. |
-| `fake` | `FakeLlmClient` (tests only) | Deterministic answers derived from the prompt, with configurable failures and latency. |
-
-Settings are bound with `@ConfigurationProperties` and can be set in `config/application.toml` or through environment variables:
+The agents use whatever LangChain4j `ChatModel` bean the application defines. By default that is Gemini, provided by `micronaut-langchain4j-googleai-gemini` and configured in `config/application.toml`:
 
 ```toml
-[llm]
-provider = "gemini"                 # LLM_PROVIDER
-
-[llm.gemini]
+[langchain4j.google-ai-gemini]
+enabled = true
 api-key = "${GEMINI_API_KEY:}"
-model = "gemini-3.5-flash-lite"     # LLM_GEMINI_MODEL
-base-url = "https://generativelanguage.googleapis.com"
+model-name = "gemini-3.5-flash-lite"   # LANGCHAIN4J_GOOGLE_AI_GEMINI_MODEL_NAME
+
+[langchain4j.google-ai-gemini.chat-model]
 temperature = 0.2
-
-[llm.openai]
-api-key = "${OPENAI_API_KEY:}"
-model = "..."                       # LLM_OPENAI_MODEL (required for this provider)
-base-url = "${OPENAI_BASE_URL:https://api.openai.com/v1}"
+timeout = "120s"
 ```
 
-For example, to run against a local Ollama model:
+To use another provider, add its Micronaut LangChain4j module to `pyproject.toml` and configure it. For example, for OpenAI or any OpenAI-compatible server such as Ollama:
 
-```bash
-LLM_PROVIDER=openai OPENAI_BASE_URL=http://localhost:11434/v1 LLM_OPENAI_MODEL=qwen3 pyronaut dev
+```toml
+# pyproject.toml, [tool.pyronaut.dependencies].runtime
+"io.micronaut.langchain4j:micronaut-langchain4j-openai",
 ```
 
-To add another provider, implement `LlmClient` in a new module and annotate it with `@Singleton` and `@Requires(property="llm.provider", value="<name>")`.
+```toml
+# config/application.toml
+[langchain4j.google-ai-gemini]
+enabled = false
 
----
+[langchain4j.open-ai]
+api-key = "${OPENAI_API_KEY}"
+model-name = "..."
+# base-url = "http://localhost:11434/v1"   # e.g. Ollama
+```
+
+No agent code changes. If several chat models are configured, pick one per agent with `langchain4j.agentic.agents.<agent-id>.chat-model`.
 
 ## Tech Stack
 
 - **Runtime & Language:** Python 3.13 on GraalPy, hosted on a GraalVM JDK 25
-- **Framework:** [Pyronaut](https://pyronaut.io) 0.0.10 / Micronaut 5.2 (Netty HTTP server and client, Serialization, Project Reactor, asyncio bridge)
-- **LLM:** Google Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`) by default, swappable via `LlmClient`
+- **Framework:** [Pyronaut](https://pyronaut.io) 0.0.10 / Micronaut 5.2 (Netty HTTP server, Serialization, Project Reactor, asyncio bridge)
+- **Agentic AI:** LangChain4j 1.20 (`langchain4j-agentic`) via Micronaut LangChain4j 2.3
+- **Structured outputs:** Micronaut JSON Schema 2.3 (compile-time `@JsonSchema`)
+- **LLM:** Google Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`), swappable for any LangChain4j provider
 - **Testing:** pytest through `pyronaut test` with `MicronautTest` fixtures and `requests.with_context`
 - **Cloud Infrastructure:** Google Cloud Run & Google Secret Manager
 - **Automation:** `pyronaut` CLI + `just` task runner
@@ -194,13 +199,12 @@ Once started, open your browser:
 
 ## Testing
 
-`pyronaut test` runs the pytest suite in `tests/` inside the application's runtime. `tests-config/application-test.toml` selects `llm.provider = "fake"`, so:
+`pyronaut test` runs the pytest suite in `tests/` inside the application's runtime. `tests-config/application-test.toml` disables Gemini, so `tests/fake_chat_model.py` provides the `ChatModel` bean:
 
-- The full pipeline (guardrail, five concurrent day planners, de-confliction, fallbacks, SSE streaming, alternatives, caching and rate limiting) is exercised deterministically, offline and without an API key.
-- Failure modes are injected with `fake-llm.*` properties per test module, for example `fake-llm.fail-tasks = "plan-day"` or `fake-llm.fail-first-attempts = 1`.
-- The real `GeminiLlmClient` and `OpenAiCompatibleLlmClient` are tested over HTTP against mock Gemini / Chat Completions endpoints served by the application under test (`tests/mock_llm_api.py`).
-
----
+- The real agents, prompts, structured outputs, tool calling, the parallel mapper, retries, fallbacks, SSE streaming, alternatives, caching and rate limiting are all exercised deterministically, offline and without an API key.
+- The fake records the JSON schema of every request, so the tests also assert that the compile-time Micronaut JSON Schema is the one sent to the model.
+- Failure modes and latency are injected per test module with `fake-llm.*` properties (bound to a `@ConfigurationProperties` class), for example `fake-llm.fail-tasks = "plan-day"` or `fake-llm.fail-first-attempts = 1`.
+- `test_gemini_chat_model.py` exercises the real Micronaut LangChain4j Gemini `ChatModel` over HTTP against a mock Gemini API served by the application under test (`tests/mock_gemini_api.py`).
 
 ## Fetching Latest Conference Schedules
 

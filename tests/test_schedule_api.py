@@ -1,4 +1,4 @@
-"""End-to-end tests of the HTTP API backed by the deterministic fake LLM."""
+"""End-to-end tests of the HTTP API backed by the deterministic fake ChatModel."""
 
 import time
 
@@ -33,7 +33,13 @@ def test_valid_schedule_generation(client):
     assert_conflict_free(body)
 
     # One guardrail call plus one planner call per conference day
-    assert stats(client)["calls"] == {"validate-interests": 1, "plan-day": 5}
+    observed = stats(client)
+    assert observed["calls"] == {"validate-interests": 1, "plan-day": 5}
+    # The structured-output schemas sent to the model are the ones Micronaut JSON
+    # Schema generated at compile time from the @JsonSchema dataclasses
+    assert observed["schemas"]["validate-interests"] == ["reason", "sanitized_interests", "valid"]
+    assert observed["schemas"]["plan-day"] == ["date", "day", "day_label", "talks"]
+    assert observed["descriptions"]["plan-day"] == "The conflict-free agenda of one conference day."
 
 
 def test_prompt_injection_rejection(client):
@@ -172,7 +178,7 @@ def test_home_redirect_and_static_ui(client):
 def test_health(client):
     body = client.get("/api/health").json()
     assert body["status"] == "UP"
-    assert body["model"] == "fake-llm"
+    assert body["model"] == "fake-chat-model"
     assert body["totalTalksLoaded"] >= 190
 
 

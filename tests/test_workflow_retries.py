@@ -9,6 +9,8 @@ def test_transient_day_failures_are_retried(client):
     events = sse_events(client.get("/api/schedule/stream", params={"interests": "Java performance"}).text)
     retries = [e for e in events if e["stage"] == "agent2_progress" and "Retrying" in e["message"]]
     assert len(retries) == 5, "Each day worker should report one retry"
+    curated = [e for e in events if e["stage"] == "agent2_progress" and "Curated" in e["message"]]
+    assert len(curated) == 5
 
     schedule = events[-1]["schedule"]
     assert schedule["valid"] is True

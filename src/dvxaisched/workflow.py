@@ -16,10 +16,16 @@
 
 1. ``InterestValidatorAgent`` guards against prompt injection and off-topic input.
 2. The catalog is pre-scored and partitioned into the five conference days.
-3. Five ``DayScheduleBuilderAgent`` calls run concurrently on the Netty event
-   loop with ``asyncio.gather``; each day is retried independently.
-4. If the parallel stage fails, the monolithic ``ScheduleBuilderAgent`` is used,
-   and if every LLM call fails a deterministic catalog schedule is returned.
+3. ``ParallelScheduleBuilderWorkflow`` (a LangChain4j ``@ParallelMapperAgent``)
+   runs one ``DayScheduleBuilderAgent`` per day concurrently; a failing day is
+   retried by the mapper's error handler (see ``agent_listeners``).
+4. If the parallel stage fails, the tool-equipped monolithic
+   ``ScheduleBuilderAgent`` is used, and if every LLM call fails a
+   deterministic catalog schedule is returned.
+
+The workflow methods are coroutines: each (blocking) LangChain4j invocation is
+handed to Micronaut's blocking executor with ``run_in_executor`` so the Netty
+event loop stays free while the model works.
 """
 
 from __future__ import annotations
@@ -27,11 +33,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Callable
+from typing import Any, Callable
 
+import java
+from dev.langchain4j.agentic.scope import AgenticScope, DefaultAgenticScope
+from dev.langchain4j.invocation import LangChain4jManaged
 from jakarta.inject import Singleton
 
-from .agents import DayScheduleBuilderAgent, InterestValidatorAgent, ScheduleBuilderAgent, TalkAlternativeAgent
+from .agent_listeners import AGENT2
+from .progress import REQUEST_ID_KEY, ProgressListener, ProgressRegistry
+from .agents import (
+    InterestValidatorAgent,
+    ParallelScheduleBuilderWorkflow,
+    ScheduleBuilderAgent,
+    TalkAlternativeAgent,
+)
 from .conference import DevoxxConferenceService, has_overlap, normalize_time
 from .models import (
     GUARDRAIL_AGENT,
@@ -44,6 +60,7 @@ from .models import (
     ValidationResult,
     WorkflowProgressEvent,
     build_devoxx_talk_url,
+    day_from_plan,
     empty_alternatives,
     progress_complete,
     progress_rejected,
@@ -52,12 +69,11 @@ from .models import (
     talk_abstract,
 )
 
+JMap = java.type("java.util.Map")
+
 LOG = logging.getLogger(__name__)
 
-ProgressListener = Callable[[WorkflowProgressEvent], None]
-
 MAX_INTERESTS_LENGTH = 500
-MAX_DAY_RETRIES = 2
 ALTERNATIVES_TIMEOUT_SECONDS = 6.0
 
 CONFERENCE_DAYS: list[tuple[str, str, str]] = [
@@ -71,17 +87,45 @@ CONFERENCE_DAYS: list[tuple[str, str, str]] = [
 DAY_SEARCH_LIMITS = {"monday": 20, "tuesday": 20, "wednesday": 25, "thursday": 25, "friday": 15}
 DAY_MIN_TALKS = {"monday": 3, "tuesday": 3, "wednesday": 5, "thursday": 5, "friday": 3}
 
-AGENT2 = "Agent 2: Schedule Optimizer"
 PARALLEL_AGENTS = "Parallel Day Optimizers"
-PARALLEL_AGENT = "Parallel Day Optimizer"
 
 
 def sanitize_for_log(value: str | None) -> str:
     return (value or "").replace("\r", " ").replace("\n", " ").strip()
 
 
+def root_cause(error: BaseException) -> str:
+    """Describes the innermost cause of an agent failure (LangChain4j wraps them in reflection exceptions)."""
+    cause = getattr(error, "java_exception", None) or error
+    for _ in range(10):
+        nested = cause.getCause() if hasattr(cause, "getCause") else None
+        if nested is None or nested is cause:
+            break
+        cause = nested
+    if hasattr(cause, "getClass"):
+        return f"{cause.getClass().getSimpleName()}: {cause.getMessage()}"
+    return f"{type(cause).__name__}: {cause}"
+
+
 def _millis_since(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+async def run_agent(scope: Any, call: Callable[[], Any]) -> Any:
+    """Runs a blocking LangChain4j invocation on Micronaut's blocking executor.
+
+    The request's agentic scope is installed as the current LangChain4j-managed
+    scope of the worker thread, so directly invoked agents share it.
+    """
+
+    def invoke() -> Any:
+        LangChain4jManaged.setCurrent(JMap.of(AgenticScope, scope))
+        try:
+            return call()
+        finally:
+            LangChain4jManaged.removeCurrent()
+
+    return await asyncio.get_running_loop().run_in_executor(None, invoke)
 
 
 @Singleton
@@ -90,15 +134,17 @@ class DevoxxAgentWorkflowService:
         self,
         conference_service: DevoxxConferenceService,
         validator_agent: InterestValidatorAgent,
-        day_schedule_agent: DayScheduleBuilderAgent,
+        parallel_schedule_workflow: ParallelScheduleBuilderWorkflow,
         schedule_builder_agent: ScheduleBuilderAgent,
         alternative_agent: TalkAlternativeAgent,
+        progress_registry: ProgressRegistry,
     ):
         self.conference_service = conference_service
         self.validator_agent = validator_agent
-        self.day_schedule_agent = day_schedule_agent
+        self.parallel_schedule_workflow = parallel_schedule_workflow
         self.schedule_builder_agent = schedule_builder_agent
         self.alternative_agent = alternative_agent
+        self.progress_registry = progress_registry
 
     async def process_schedule_request(
         self, user_interests: str | None, progress: ProgressListener | None = None
@@ -120,6 +166,20 @@ class DevoxxAgentWorkflowService:
 
         total_start = time.monotonic()
 
+        # Agent callbacks find this request's progress listener through the request id
+        request_id = self.progress_registry.register(emit)
+        try:
+            return await self._run_pipeline(raw_input, request_id, emit, total_start)
+        finally:
+            self.progress_registry.unregister(request_id)
+
+    async def _run_pipeline(
+        self, raw_input: str, request_id: str, emit: ProgressListener, total_start: float
+    ) -> ScheduleResponse:
+        # Establish an AgenticScope across the directly invoked agents
+        scope = DefaultAgenticScope.ephemeralAgenticScope()
+        scope.writeState(REQUEST_ID_KEY, request_id)
+
         # Step 1: guardrail validation
         LOG.info("Step 1 [Agent 1 - Validator]: Validating input '%s'", sanitize_for_log(raw_input))
         emit(WorkflowProgressEvent(
@@ -128,9 +188,11 @@ class DevoxxAgentWorkflowService:
         ))
         a1_start = time.monotonic()
         try:
-            validation = await self.validator_agent.validate(raw_input)
+            validation = await run_agent(scope, lambda: self.validator_agent.validate(raw_input))
+            if validation is None:
+                validation = self._fallback_validation()
         except Exception as e:
-            LOG.error("Error executing InterestValidatorAgent: %s", e)
+            LOG.error("Error executing InterestValidatorAgent: %s", root_cause(e))
             validation = self._fallback_validation()
         a1_duration = _millis_since(a1_start)
         LOG.info(
@@ -139,7 +201,7 @@ class DevoxxAgentWorkflowService:
         )
 
         if not validation.valid:
-            message = validation.reason.strip() or (
+            message = (validation.reason or "").strip() or (
                 "The request could not be accepted. Please enter topics related to software engineering or technology."
             )
             emit(progress_rejected(message, a1_duration))
@@ -160,13 +222,15 @@ class DevoxxAgentWorkflowService:
 
         emit(WorkflowProgressEvent(
             "agent2_start", PARALLEL_AGENTS,
-            "Dispatching 5 parallel AI workers to synthesize Mon–Fri concurrently...",
+            "Dispatching 5 parallel Gemini workers to synthesize Mon–Fri concurrently...",
         ))
         a2_start = time.monotonic()
         final_response: ScheduleResponse | None = None
 
         try:
-            raw_days = await asyncio.gather(*(self._plan_day_with_retries(r, emit) for r in day_requests))
+            LOG.info("Invoking ParallelScheduleBuilderWorkflow across 5 parallel day workers")
+            planned = await run_agent(scope, lambda: self.parallel_schedule_workflow.schedule_days(day_requests, request_id))
+            raw_days = [day_from_plan(d) for d in (planned or []) if d is not None]
             if any(d.talks for d in raw_days):
                 days = self._enrich_days_with_abstracts(self._deconflict_and_backfill_days(raw_days, query))
                 final_response = ScheduleResponse(
@@ -177,10 +241,10 @@ class DevoxxAgentWorkflowService:
                 )
                 LOG.info("Parallel day optimizers completed successfully with %d days", len(days))
         except Exception as e:
-            LOG.error("Parallel day optimizers failed, trying fallback: %s", e)
+            LOG.error("ParallelScheduleBuilderWorkflow failed, trying fallback: %s", root_cause(e))
 
         if final_response is None:
-            final_response = await self._monolithic_fallback(query, all_candidates, emit)
+            final_response = await self._monolithic_fallback(scope, query, all_candidates, emit)
 
         if final_response is None:
             final_response = self._build_fallback_schedule(query, all_candidates)
@@ -213,47 +277,25 @@ class DevoxxAgentWorkflowService:
             day_requests.append(DayPlanRequest(day, date, label, query, prompt))
         return day_requests, all_candidates
 
-    async def _plan_day_with_retries(self, request: DayPlanRequest, emit: ProgressListener) -> DaySchedule:
-        attempt = 0
-        while True:
-            try:
-                day = await self.day_schedule_agent.build_day_schedule(request)
-                emit(WorkflowProgressEvent(
-                    "agent2_progress", PARALLEL_AGENT, f"Curated {request.day_label} concurrently"
-                ))
-                return day
-            except Exception as e:
-                if attempt >= MAX_DAY_RETRIES:
-                    LOG.error("Day worker '%s' exceeded max retries: %s", request.day, e)
-                    raise
-                attempt += 1
-                LOG.warning(
-                    "Error in day worker '%s' (attempt %d of %d): %s. Retrying...",
-                    request.day, attempt, MAX_DAY_RETRIES, e,
-                )
-                emit(WorkflowProgressEvent(
-                    "agent2_progress", PARALLEL_AGENT,
-                    f"Transient issue on day worker ({request.day}). Retrying (attempt {attempt})...",
-                ))
-
     async def _monolithic_fallback(
-        self, query: str, candidates: list[ConferenceTalk], emit: ProgressListener
+        self, scope: Any, query: str, candidates: list[ConferenceTalk], emit: ProgressListener
     ) -> ScheduleResponse | None:
         try:
             LOG.warning("Falling back to monolithic ScheduleBuilderAgent")
             emit(WorkflowProgressEvent(
-                "agent2_start", AGENT2, "Curating conflict-free conference timetable in a single pass..."
+                "agent2_start", AGENT2, "Curating conflict-free conference timetable with Gemini 3.5 Flash-Lite..."
             ))
             unique = list({t.id: t for t in candidates}.values())
             prompt = self.conference_service.format_talks_for_prompt(unique)
-            response = await self.schedule_builder_agent.build_schedule(query, prompt)
-            if any(d.talks for d in response.days):
-                days = self._enrich_days_with_abstracts(self._deconflict_and_backfill_days(response.days, query))
+            response = await run_agent(scope, lambda: self.schedule_builder_agent.build_schedule(query, prompt))
+            planned_days = [day_from_plan(d) for d in (response.days or []) if d is not None] if response else []
+            if any(d.talks for d in planned_days):
+                days = self._enrich_days_with_abstracts(self._deconflict_and_backfill_days(planned_days, query))
                 return ScheduleResponse(
                     valid=True, theme=response.theme or query, overview=response.overview, days=days
                 )
         except Exception as e:
-            LOG.error("Error executing ScheduleBuilderAgent fallback: %s", e)
+            LOG.error("Error executing ScheduleBuilderAgent fallback: %s", root_cause(e))
         return None
 
     def _enrich_days_with_abstracts(self, days: list[DaySchedule]) -> list[DaySchedule]:
@@ -386,18 +428,22 @@ class DevoxxAgentWorkflowService:
 
         # 1. Ask the LLM for a recommendation, bounded by a timeout
         try:
-            selections = await asyncio.wait_for(
-                self.alternative_agent.recommend_alternatives(
+            formatted_candidates = self.conference_service.format_talks_for_prompt(candidates)
+            loop = asyncio.get_running_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: self.alternative_agent.recommend_alternatives(
                     interests,
                     current.id,
                     current.title,
                     current.track or "General",
                     current.room or "Main",
-                    self.conference_service.format_talks_for_prompt(candidates),
-                ),
+                    formatted_candidates,
+                )),
                 ALTERNATIVES_TIMEOUT_SECONDS,
             )
-            for selection in selections:
+            for selection in (result.selections or []) if result is not None else []:
+                if selection is None:
+                    continue
                 if len(selected) >= 3:
                     break
                 if selection.talk_id <= 0 or selection.talk_id == current.id or selection.talk_id in selected_ids:
@@ -408,12 +454,12 @@ class DevoxxAgentWorkflowService:
                 if match is None:
                     continue
                 selected_ids.add(match.id)
-                reason = selection.reason.strip() or f"Recommended alternative in the {match.track or 'technical'} track."
+                reason = (selection.reason or "").strip() or f"Recommended alternative in the {match.track or 'technical'} track."
                 selected.append(scheduled_from_catalog(match, reason))
         except (asyncio.TimeoutError, TimeoutError):
             LOG.warning("AlternativeAgent timed out for talk %d. Falling back to deterministic ranking.", talk_id)
         except Exception as e:
-            LOG.warning("AlternativeAgent invocation failed for talk %d: %s. Falling back to deterministic ranking.", talk_id, e)
+            LOG.warning("AlternativeAgent invocation failed for talk %d: %s. Falling back to deterministic ranking.", talk_id, root_cause(e))
 
         # 2. Backfill with deterministic candidate ranking if the LLM returned fewer than the target
         target = min(3, len(candidates))

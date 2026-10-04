@@ -14,8 +14,8 @@
 
 """Data model shared by the HTTP API, the conference catalog and the agents.
 
-The JSON wire format uses camelCase property names (``talkId``, ``startTime``)
-to stay compatible with the web UI, while Python attributes use snake_case.
+The HTTP API uses camelCase property names (``talkId``, ``startTime``) to stay
+compatible with the web UI, while Python attributes use snake_case.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 from com.fasterxml.jackson.annotation import JsonProperty
+from micronaut.jsonschema import JsonSchema
 from micronaut.serde.annotation import Serdeable
 
 EVENT_SLUG = "dvbe26"
@@ -198,26 +199,124 @@ def progress_rejected(reason: str, duration_ms: int) -> WorkflowProgressEvent:
 
 
 # ---------------------------------------------------------------------------
-# Agent-internal structures (never serialized by Micronaut)
+# Agent input and structured output types
 # ---------------------------------------------------------------------------
+# LangChain4j parses model answers into these classes with Jackson. The JSON
+# schema sent to the model is generated at compile time from them by
+# Micronaut JSON Schema (``@JsonSchema``; see ``structured_output.py``), with
+# the docstrings as descriptions. They deliberately use plain snake_case
+# attributes: a JsonProperty rename on a dataclass field is not carried over to
+# the generated constructor parameter, which Jackson needs.
 
 
+@JsonSchema
+@Serdeable
 @dataclass
 class ValidationResult:
+    """Outcome of the guardrail check of the attendee's interests."""
+
     valid: bool
-    reason: str = ""
+    """true if the input is acceptable and safe, false if rejected"""
+    reason: str
+    """If invalid, a polite explanation and advice on what to enter instead; otherwise empty or a brief acknowledgment"""
     sanitized_interests: str | None = None
+    """A cleaned up, concise representation of the user's technical interests"""
 
 
+@JsonSchema
+@Serdeable
+@dataclass
+class PlannedTalk:
+    """A conference talk selected for the attendee."""
+
+    talk_id: int
+    """Official talk ID number"""
+    day: str
+    """Lowercase day name, e.g. monday"""
+    date: str
+    """Date, e.g. 2026-10-05"""
+    start_time: str
+    """Start time, e.g. 09:30"""
+    end_time: str
+    """End time, e.g. 12:30"""
+    room: str
+    """Room name, e.g. TBA 2"""
+    title: str
+    """Exact title of the talk"""
+    speakers: str
+    """Speaker name(s) and company"""
+    track: str
+    """Track name"""
+    session_type: str
+    """Session type, e.g. Deep Dive, Conference, Keynote, Tools-in-Action, Lunch Talk, BOF, Hands-on Lab"""
+    reason: str
+    """Why this talk was selected for the attendee"""
+
+
+@JsonSchema
+@Serdeable
+@dataclass
+class PlannedDay:
+    """The conflict-free agenda of one conference day."""
+
+    day: str
+    """Lowercase day name, e.g. monday"""
+    date: str
+    """Date, e.g. 2026-10-05"""
+    day_label: str
+    """Human-readable label of the day"""
+    talks: list[PlannedTalk] = field(default_factory=list)
+    """Selected talks in chronological order"""
+
+
+@JsonSchema
+@Serdeable
+@dataclass
+class PlannedSchedule:
+    """A personalized 5-day conference schedule."""
+
+    theme: str
+    """Overall theme name of the schedule"""
+    overview: str
+    """Motivating summary overview of the schedule"""
+    days: list[PlannedDay] = field(default_factory=list)
+    """The days of the schedule in chronological order"""
+
+
+@JsonSchema
+@Serdeable
+@dataclass
+class AlternativeSelection:
+    """An alternative talk for the slot being replaced."""
+
+    talk_id: int
+    """Official numeric talk ID of the alternative"""
+    reason: str
+    """Concise 1-2 sentence rationale for the attendee"""
+
+
+@JsonSchema
+@Serdeable
+@dataclass
+class TalkAlternativesResult:
+    """The selected alternative talks."""
+
+    selections: list[AlternativeSelection] = field(default_factory=list)
+    """Up to 3 distinct alternatives"""
+
+
+@Serdeable
 @dataclass
 class DayPlanRequest:
+    """Input of one parallel day planner; rendered into the prompt with ``str()``."""
+
     day: str
     date: str
     day_label: str
     interests: str
     candidate_talks: str
 
-    def to_prompt(self) -> str:
+    def __str__(self) -> str:
         return (
             f"User interests: {self.interests}\n\n"
             f"Day to schedule: {self.day_label} (Date: {self.date}, Day id: {self.day})\n\n"
@@ -231,14 +330,33 @@ class DayPlanRequest:
         )
 
 
-@dataclass
-class AlternativeSelection:
-    talk_id: int
-    reason: str = ""
+def scheduled_from_plan(talk: PlannedTalk) -> ScheduledTalk:
+    return ScheduledTalk(
+        talk_id=talk.talk_id,
+        day=(talk.day or "").lower(),
+        date=talk.date or "",
+        start_time=talk.start_time or "",
+        end_time=talk.end_time or "",
+        room=talk.room or "",
+        title=talk.title or "",
+        speakers=talk.speakers or "",
+        track=talk.track or "",
+        session_type=talk.session_type or "",
+        reason=talk.reason or "",
+    )
+
+
+def day_from_plan(day: PlannedDay) -> DaySchedule:
+    return DaySchedule(
+        day=(day.day or "").lower(),
+        date=day.date or "",
+        day_label=day.day_label or "",
+        talks=[scheduled_from_plan(t) for t in (day.talks or []) if t is not None],
+    )
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers for JSON produced by the catalog file and by LLMs
+# Parsing of the embedded catalog file
 # ---------------------------------------------------------------------------
 
 
@@ -273,31 +391,4 @@ def conference_talk_from_dict(data: dict[str, Any]) -> ConferenceTalk:
         ],
         description=data.get("description") or None,
         url=data.get("url") or None,
-    )
-
-
-def scheduled_talk_from_dict(data: dict[str, Any]) -> ScheduledTalk:
-    return ScheduledTalk(
-        talk_id=_int(data.get("talkId")),
-        day=_str(data.get("day")).lower(),
-        date=_str(data.get("date")),
-        start_time=_str(data.get("startTime")),
-        end_time=_str(data.get("endTime")),
-        room=_str(data.get("room")),
-        title=_str(data.get("title")),
-        speakers=_str(data.get("speakers")),
-        track=_str(data.get("track")),
-        session_type=_str(data.get("sessionType")),
-        reason=_str(data.get("reason")),
-        talk_abstract=data.get("talkAbstract") or None,
-        url=data.get("url") or None,
-    )
-
-
-def day_schedule_from_dict(data: dict[str, Any]) -> DaySchedule:
-    return DaySchedule(
-        day=_str(data.get("day")).lower(),
-        date=_str(data.get("date")),
-        day_label=_str(data.get("dayLabel")),
-        talks=[scheduled_talk_from_dict(t) for t in data.get("talks") or [] if isinstance(t, dict)],
     )

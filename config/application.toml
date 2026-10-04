@@ -30,7 +30,8 @@ mapping = "/**"
 # Async routes are served from per-event-loop copies of Python beans when the
 # GraalPy context pool is enabled; that currently drops Java constructor
 # arguments and duplicates singleton state (rate limiter, cache), so the
-# application runs in a single shared context.
+# application runs in a single shared context (as the Micronaut LangChain4j
+# Python test suite does).
 [micronaut.python.pool]
 enabled = false
 
@@ -39,26 +40,30 @@ read-timeout = "120s"
 connect-timeout = "30s"
 
 # ------------------------------------------------------------------------------
-# LLM backend selection
+# LangChain4j
 # ------------------------------------------------------------------------------
-# The agents talk to an `LlmClient` abstraction. Pick the implementation with
-# `llm.provider` (env: LLM_PROVIDER):
-#   gemini  - Google Gemini via the Generative Language REST API (default)
-#   openai  - any OpenAI-compatible Chat Completions API (OpenAI, Ollama, vLLM, ...)
-[llm]
-provider = "gemini"
+# JSON schemas of the agents' structured outputs are generated at compile time
+# by Micronaut JSON Schema (`@JsonSchema`) and sent to the chat model.
+# Strict mode marks every non-nullable property as required.
+[micronaut.jsonschema]
+strictMode = true
 
-[llm.gemini]
+# The agents are stateless: do not attach the default in-memory chat memory
+# (the parallel mapper rejects sub-agents that have chat memory).
+[langchain4j.chat-memory-store.inmemory]
+enabled = false
+
+# Chat model used by every agent. To use another provider, add its module
+# (e.g. micronaut-langchain4j-openai) to pyproject.toml, configure it under its
+# own prefix (e.g. [langchain4j.open-ai]) and set `enabled = false` here.
+[langchain4j.google-ai-gemini]
+enabled = true
 api-key = "${GEMINI_API_KEY:}"
-model = "gemini-3.5-flash-lite"
-base-url = "https://generativelanguage.googleapis.com"
-temperature = 0.2
+model-name = "gemini-3.5-flash-lite"
 
-[llm.openai]
-api-key = "${OPENAI_API_KEY:}"
-# model = "..."  (required when llm.provider = "openai"; env: LLM_OPENAI_MODEL)
-base-url = "${OPENAI_BASE_URL:https://api.openai.com/v1}"
+[langchain4j.google-ai-gemini.chat-model]
 temperature = 0.2
+timeout = "120s"
 
 # ------------------------------------------------------------------------------
 # IP & session rate limiting
@@ -70,7 +75,7 @@ session-window-seconds = 60
 ip-limit = 60
 ip-window-seconds = 60
 
-# In-memory query schedule cache (avoids repeated LLM calls for common prompts)
+# In-memory query schedule cache (avoids repeated Gemini calls for common prompts)
 [cache.schedule]
 enabled = true
 ttl-minutes = 120

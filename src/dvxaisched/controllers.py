@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Annotated
 
 import java
+from dev.langchain4j.model.chat import ChatModel
 from micronaut.http import HttpRequest, HttpResponse, HttpStatus, MediaType
 from micronaut.http.annotation import Body, Controller, Get, Post, QueryValue
 from micronaut.http.sse import Event
@@ -28,7 +30,6 @@ from micronaut.http.sse import Event
 from .cache import ScheduleCacheBean
 from .client_ip import resolve_client_ip, resolve_session_id
 from .conference import DevoxxConferenceService
-from .llm import LlmClient
 from .models import (
     GUARDRAIL_AGENT,
     ConferenceTalk,
@@ -41,7 +42,8 @@ from .models import (
     rejected_schedule,
 )
 from .rate_limiter import RateLimitDecision, RateLimiterService
-from .workflow import AGENT2, MAX_INTERESTS_LENGTH, DevoxxAgentWorkflowService, sanitize_for_log
+from .agent_listeners import AGENT2
+from .workflow import MAX_INTERESTS_LENGTH, DevoxxAgentWorkflowService, sanitize_for_log
 
 Flux = java.type("reactor.core.publisher.Flux")
 Sinks = java.type("reactor.core.publisher.Sinks")
@@ -105,13 +107,13 @@ class ScheduleController:
         conference_service: DevoxxConferenceService,
         rate_limiter: RateLimiterService,
         schedule_cache: ScheduleCacheBean,
-        llm: LlmClient,
+        chat_model: ChatModel,
     ):
         self.workflow_service = workflow_service
         self.conference_service = conference_service
         self.rate_limiter = rate_limiter
         self.schedule_cache = schedule_cache
-        self.llm = llm
+        self.model_name = self._model_name(chat_model)
         # A Java semaphore is safe to share between the Netty event loops and
         # the GraalPy contexts serving concurrent requests.
         self.workflow_limiter = Semaphore(MAX_CONCURRENT_WORKFLOWS)
@@ -194,9 +196,13 @@ class ScheduleController:
             return Flux.just(Event.of(progress_rejected(BUSY_MESSAGE, 0)))
 
         sink = Sinks.many().unicast().onBackpressureBuffer()
+        # Progress events also arrive from the parallel day workers' threads;
+        # Reactor sinks require serialized emissions.
+        emit_lock = threading.Lock()
 
         def emit(event: WorkflowProgressEvent) -> None:
-            sink.tryEmitNext(Event.of(event))
+            with emit_lock:
+                sink.tryEmitNext(Event.of(event))
 
         async def run_workflow() -> None:
             try:
@@ -213,7 +219,8 @@ class ScheduleController:
                 ))
             finally:
                 self.workflow_limiter.release()
-                sink.tryEmitComplete()
+                with emit_lock:
+                    sink.tryEmitComplete()
 
         loop = asyncio.get_running_loop()
         task = loop.create_task(run_workflow())
@@ -270,5 +277,15 @@ class ScheduleController:
             "dates": "October 5-9, 2026",
             "venue": "Kinepolis, Antwerp",
             "totalTalksLoaded": len(self.conference_service.talks),
-            "model": self.llm.model_name(),
+            "model": self.model_name,
         }
+
+    @staticmethod
+    def _model_name(chat_model: ChatModel) -> str:
+        try:
+            name = chat_model.defaultRequestParameters().modelName()
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        return "unknown"
