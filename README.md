@@ -233,7 +233,7 @@ just fetch dvbe25
 
 ## Deployment to Google Cloud Run
 
-`just deploy` builds the fat JAR and deploys it from source. Cloud Build packages the JAR with the [`Dockerfile`](Dockerfile), which runs it on a GraalVM JDK 25 image so the embedded GraalPy runtime is JIT-compiled.
+`just deploy` builds the fat JAR and deploys it from source. Cloud Build packages the JAR with the [`Dockerfile`](Dockerfile), which runs it on the Oracle GraalVM `25i4` JDK image (`container-registry.oracle.com/graalvm/jdk:25i4`, GraalVM 25.0.4.1.1). That matches the polyglot version of the embedded GraalPy runtime, so Python code is JIT-compiled.
 
 ### Deploying via `just`
 

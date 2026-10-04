@@ -14,8 +14,9 @@
 
 # Runtime image for the Pyronaut fat JAR. Build the JAR first with
 # `pyronaut build --jar` (or `just build`). The embedded GraalPy runtime needs a
-# GraalVM JDK so that Python code is JIT-compiled.
-FROM container-registry.oracle.com/graalvm/jdk:25
+# GraalVM JDK that matches its polyglot version (25.4.4.1.1) so that Python code
+# is JIT-compiled: the 25i4 image ships Oracle GraalVM 25.0.4.1.1.
+FROM container-registry.oracle.com/graalvm/jdk:25i4
 WORKDIR /app
 
 COPY dist/dvxaisched-0.1.0.jar /app/application.jar
