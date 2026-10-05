@@ -18,6 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Playwright downloads its browsers on first use; cache them across runs
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: playwright-${{ runner.os }}-
+
       # GraalVM JDK, Pyronaut CLI, GraalPy .venv with pytest and `pyronaut setup`, all cached
       - uses: micronaut-projects/setup-pyronaut@v1
 
@@ -27,7 +35,8 @@ jobs:
       - name: Validate production configuration
         run: pyronaut validate-config --scenario production
 
-      # Runs against the fake ChatModel. tests/test_gemini_live.py additionally
+      # The pytest suites and the Playwright browser suite (tests/ScheduleUiTest.py)
+      # in one run, against the fake ChatModel. tests/test_gemini_live.py additionally
       # exercises the real Gemini API when the GEMINI_API_KEY secret is available
       # (it is skipped otherwise, e.g. for pull requests from forks).
       - name: Test
