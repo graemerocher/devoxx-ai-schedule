@@ -31,8 +31,9 @@ mapping = "/**"
 # so are the services they reach on every request (DevoxxConferenceService,
 # RateLimiterService), whose shared state lives in Java (Caffeine caches, a
 # Semaphore bean). Singletons the pooled types may keep depending on:
-# - ScheduleCache / DevoxxAgentWorkflowService: schedules are cached and their
-#   time is spent waiting for Gemini, so pooling them would gain little;
+# - DevoxxAgentWorkflowService: schedules are cached (ScheduleCache, itself
+#   pooled) and generating one is spent waiting for Gemini, so pooling the
+#   workflow would gain little;
 # - RateLimitConfig: configuration, read once when a RateLimiterService is created.
 #
 # The pool is enabled for the test suite (tests-config/application-test.toml)
@@ -42,7 +43,7 @@ mapping = "/**"
 # `enabled = true` once that is fixed.
 [micronaut.python.pool]
 enabled = false
-ignoreDependencies = ["ScheduleCache", "DevoxxAgentWorkflowService", "RateLimitConfig"]
+ignoreDependencies = ["DevoxxAgentWorkflowService", "RateLimitConfig"]
 
 [micronaut.http.client]
 read-timeout = "120s"
