@@ -12,23 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-session and per-IP sliding window rate limiting."""
+"""Per-session and per-IP sliding window rate limiting.
+
+``RateLimiterService`` is ``@ContextPooled``: every GraalPy context of the pool
+has its own instance, so rate checks run in parallel. The sliding windows are
+shared through Java concurrent maps (Caffeine caches managed by Micronaut
+Cache), which every context sees, and each window is updated atomically with
+``ConcurrentMap.compute``.
+"""
 
 from __future__ import annotations
 
 import logging
 import math
-import threading
 import time
 from dataclasses import dataclass
+from typing import Annotated, Any
 
-from jakarta.inject import Singleton
-from java.util.concurrent import Semaphore
-from micronaut.context.annotation import ConfigurationProperties
+from jakarta.inject import Named, Singleton
+from java.util import ArrayList
+from java.util.concurrent import ConcurrentHashMap, Semaphore
+from micronaut.cache import SyncCache
+from micronaut.context.annotation import ConfigurationProperties, Factory
+from micronaut.context.python.scope import ContextPooled
 
 LOG = logging.getLogger(__name__)
 
 MAX_CONCURRENT_WORKFLOWS = 10
+WORKFLOW_LIMITER = "workflow-limiter"
+SESSION_WINDOWS_CACHE = "ratelimit-sessions"
+IP_WINDOWS_CACHE = "ratelimit-ips"
 
 
 @dataclass
@@ -46,39 +59,28 @@ class RateLimitDecision:
         return RateLimitDecision(False, max(1, retry_after_seconds), reason)
 
 
-class SlidingWindow:
-    """Thread-safe O(1) circular buffer sliding-window rate limiter."""
+def try_acquire(windows: Any, key: str, limit: int, window_seconds: float, now: float) -> int:
+    """Records a request in the sliding window of ``key`` if it is under ``limit``.
 
-    def __init__(self, limit: int, window_seconds: float):
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self.timestamps = [0.0] * limit
-        self.head = 0
-        self.count = 0
-        self.last_access = time.time()
-        self._lock = threading.Lock()
+    The window is a Java list of request timestamps replaced atomically with
+    ``ConcurrentMap.compute``. Returns 0 when the request is allowed, otherwise
+    the number of seconds until the oldest request leaves the window.
+    """
+    retry_after = 0
 
-    def try_acquire(self, now: float) -> RateLimitDecision:
-        with self._lock:
-            self.last_access = now
-            if self.count < self.limit:
-                self.timestamps[self.count] = now
-                self.count += 1
-                return RateLimitDecision.allow()
+    def remap(_key, timestamps):
+        nonlocal retry_after
+        recent = [t for t in (timestamps or []) if now - t < window_seconds]
+        if len(recent) < limit:
+            recent.append(now)
+            retry_after = 0
+        else:
+            retry_after = max(1, math.ceil(window_seconds - (now - min(recent))))
+        # A Java list, so the window is readable from every GraalPy context
+        return ArrayList(recent)
 
-            # The oldest request in the current circular window is at index `head`
-            elapsed = now - self.timestamps[self.head]
-            if elapsed < self.window_seconds:
-                return RateLimitDecision.reject(math.ceil(self.window_seconds - elapsed), "Limit exceeded")
-
-            # Window has slid: overwrite the oldest slot and advance head
-            self.timestamps[self.head] = now
-            self.head = (self.head + 1) % self.limit
-            return RateLimitDecision.allow()
-
-    def is_stale(self, now: float, max_idle_seconds: float) -> bool:
-        with self._lock:
-            return (now - self.last_access) > max_idle_seconds
+    windows.compute(key, remap)
+    return retry_after
 
 
 class RateLimiter:
@@ -89,22 +91,16 @@ class RateLimiter:
         session_window_seconds: int = 60,
         ip_limit: int = 60,
         ip_window_seconds: int = 60,
+        session_windows: Any | None = None,
+        ip_windows: Any | None = None,
     ):
         self.enabled = enabled
         self.session_limit = max(1, session_limit)
         self.session_window = float(max(1, session_window_seconds))
         self.ip_limit = max(1, ip_limit)
         self.ip_window = float(max(1, ip_window_seconds))
-        self._session_windows: dict[str, SlidingWindow] = {}
-        self._ip_windows: dict[str, SlidingWindow] = {}
-        self._lock = threading.Lock()
-
-    def _window(self, windows: dict[str, SlidingWindow], key: str, limit: int, window: float) -> SlidingWindow:
-        with self._lock:
-            win = windows.get(key)
-            if win is None:
-                win = windows[key] = SlidingWindow(limit, window)
-            return win
+        self.session_windows = session_windows if session_windows is not None else ConcurrentHashMap()
+        self.ip_windows = ip_windows if ip_windows is not None else ConcurrentHashMap()
 
     def check_rate_limit(self, session_id: str | None, client_ip: str | None) -> RateLimitDecision:
         if not self.enabled:
@@ -114,43 +110,28 @@ class RateLimiter:
         # 1. Session limit first, so a throttled session does not burn shared IP aggregate tokens
         effective_session = session_id if session_id and session_id.strip() else client_ip
         if effective_session and effective_session.strip():
-            decision = self._window(
-                self._session_windows, effective_session, self.session_limit, self.session_window
-            ).try_acquire(now)
-            if not decision.allowed:
-                LOG.warning("Session rate limit exceeded for %s: retry in %ds", effective_session, decision.retry_after_seconds)
+            retry_after = try_acquire(self.session_windows, effective_session, self.session_limit, self.session_window, now)
+            if retry_after:
+                LOG.warning("Session rate limit exceeded for %s: retry in %ds", effective_session, retry_after)
                 return RateLimitDecision.reject(
-                    decision.retry_after_seconds,
-                    f"Rate limit reached (max {self.session_limit} requests/minute). "
-                    f"Please wait {decision.retry_after_seconds} seconds.",
+                    retry_after,
+                    f"Rate limit reached (max {self.session_limit} requests/minute). Please wait {retry_after} seconds.",
                 )
 
         # 2. IP aggregate limit (protects against a single IP generating thousands of fake sessions)
         if client_ip and client_ip.strip():
-            decision = self._window(self._ip_windows, client_ip, self.ip_limit, self.ip_window).try_acquire(now)
-            if not decision.allowed:
-                LOG.warning("IP aggregate rate limit exceeded for %s: retry in %ds", client_ip, decision.retry_after_seconds)
+            retry_after = try_acquire(self.ip_windows, client_ip, self.ip_limit, self.ip_window, now)
+            if retry_after:
+                LOG.warning("IP aggregate rate limit exceeded for %s: retry in %ds", client_ip, retry_after)
                 return RateLimitDecision.reject(
-                    decision.retry_after_seconds,
-                    f"Too many requests from this network. Please wait {decision.retry_after_seconds} seconds.",
+                    retry_after,
+                    f"Too many requests from this network. Please wait {retry_after} seconds.",
                 )
-
-        # Periodically clean up stale records to prevent memory growth
-        if len(self._session_windows) > 2000:
-            self._prune(self._session_windows, self.session_window * 3, now)
-        if len(self._ip_windows) > 2000:
-            self._prune(self._ip_windows, self.ip_window * 3, now)
         return RateLimitDecision.allow()
 
-    def _prune(self, windows: dict[str, SlidingWindow], max_idle: float, now: float) -> None:
-        with self._lock:
-            for key in [k for k, w in windows.items() if w.is_stale(now, max_idle)]:
-                del windows[key]
-
     def reset(self) -> None:
-        with self._lock:
-            self._session_windows.clear()
-            self._ip_windows.clear()
+        self.session_windows.clear()
+        self.ip_windows.clear()
 
 
 @ConfigurationProperties("ratelimit")
@@ -162,31 +143,35 @@ class RateLimitConfig:
     ip_window_seconds: int = 60
 
 
-@Singleton
+@ContextPooled
 class RateLimiterService(RateLimiter):
-    def __init__(self, config: RateLimitConfig):
+    """The rate limiter of the application; idle windows expire with their cache entries."""
+
+    def __init__(
+        self,
+        config: RateLimitConfig,
+        session_windows: Annotated[SyncCache, Named(SESSION_WINDOWS_CACHE)],
+        ip_windows: Annotated[SyncCache, Named(IP_WINDOWS_CACHE)],
+    ):
         super().__init__(
             config.enabled,
             config.session_limit,
             config.session_window_seconds,
             config.ip_limit,
             config.ip_window_seconds,
+            session_windows.getNativeCache().asMap(),
+            ip_windows.getNativeCache().asMap(),
         )
 
 
-@Singleton
-class WorkflowLimiter:
-    """Bounds the number of schedule workflows running at the same time.
+@Factory
+class WorkflowLimiterFactory:
+    @Singleton
+    @Named(WORKFLOW_LIMITER)
+    def workflow_limiter(self) -> Semaphore:
+        """Bounds the schedule workflows running at once.
 
-    A Java semaphore held by a singleton is shared by every Netty event loop and
-    GraalPy context serving requests.
-    """
-
-    def __init__(self):
-        self._semaphore = Semaphore(MAX_CONCURRENT_WORKFLOWS)
-
-    def try_acquire(self) -> bool:
-        return self._semaphore.tryAcquire()
-
-    def release(self) -> None:
-        self._semaphore.release()
+        Exposed as a Java ``Semaphore`` bean so that pooled route modules in every
+        GraalPy context share the same permits.
+        """
+        return Semaphore(MAX_CONCURRENT_WORKFLOWS)
