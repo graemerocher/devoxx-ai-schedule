@@ -15,7 +15,9 @@
 """HTTP API of the schedule curator.
 
 A classless route module: ``Controller("/api")`` declares the prefix and the
-collaborators are injected as module attributes.
+collaborators are injected as module attributes. Like every unscoped route
+module it is pooled (an instance per GraalPy context); see
+``config/application.toml`` for how its dependencies are pooled in turn.
 """
 
 from __future__ import annotations
@@ -26,7 +28,8 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 from dev.langchain4j.model.chat import ChatModel
-from jakarta.inject import Inject
+from jakarta.inject import Inject, Named
+from java.util.concurrent import Semaphore
 from micronaut.http import HttpRequest, HttpResponse, HttpStatus, MediaType
 from micronaut.http.annotation import Body, Controller, Get, Post, QueryValue
 from micronaut.http.sse import Event
@@ -46,7 +49,7 @@ from .models import (
     progress_rejected,
     rejected_schedule,
 )
-from .rate_limiter import MAX_CONCURRENT_WORKFLOWS, RateLimitDecision, RateLimiterService, WorkflowLimiter
+from .rate_limiter import MAX_CONCURRENT_WORKFLOWS, WORKFLOW_LIMITER, RateLimitDecision, RateLimiterService
 from .workflow import MAX_INTERESTS_LENGTH, DevoxxAgentWorkflowService, sanitize_for_log
 
 Controller("/api")
@@ -54,7 +57,7 @@ Controller("/api")
 workflow_service: Annotated[DevoxxAgentWorkflowService, Inject]
 conference_service: Annotated[DevoxxConferenceService, Inject]
 rate_limiter: Annotated[RateLimiterService, Inject]
-workflow_limiter: Annotated[WorkflowLimiter, Inject]
+workflow_limiter: Annotated[Semaphore, Inject, Named(WORKFLOW_LIMITER)]
 schedule_cache: Annotated[ScheduleCache, Inject]
 chat_model: Annotated[ChatModel, Inject]
 
@@ -128,7 +131,7 @@ async def generate_schedule(request: Annotated[ScheduleRequest, Body], http_requ
         return HttpResponse.ok(cached)
 
     # 3. Concurrency limiter & workflow execution
-    if not workflow_limiter.try_acquire():
+    if not workflow_limiter.tryAcquire():
         LOG.warning("Concurrently running schedule workflows limit reached (%d); rejecting request", MAX_CONCURRENT_WORKFLOWS)
         return HttpResponse.status(HttpStatus.SERVICE_UNAVAILABLE).body(rejected_schedule(BUSY_MESSAGE))
     try:
@@ -183,7 +186,7 @@ async def stream_schedule(
         return
 
     # 3. Concurrency limiter & streaming execution on the request's event loop
-    if not workflow_limiter.try_acquire():
+    if not workflow_limiter.tryAcquire():
         LOG.warning("Concurrently running schedule workflows limit reached (%d); rejecting request", MAX_CONCURRENT_WORKFLOWS)
         yield Event.of(progress_rejected(BUSY_MESSAGE, 0))
         return

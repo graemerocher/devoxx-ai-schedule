@@ -27,13 +27,23 @@ enabled = true
 paths = ["classpath:public"]
 mapping = "/**"
 
-# Async routes are served from per-event-loop copies of Python beans when the
-# GraalPy context pool is enabled; that currently drops Java constructor
-# arguments and duplicates singleton state (rate limiter, cache), so the
-# application runs in a single shared context (as the Micronaut LangChain4j
-# Python test suite does).
+# GraalPy context pool: route modules are pooled (one instance per context), and
+# so are the services they reach on every request (DevoxxConferenceService,
+# RateLimiterService), whose shared state lives in Java (Caffeine caches, a
+# Semaphore bean). Singletons the pooled types may keep depending on:
+# - DevoxxAgentWorkflowService: schedules are cached (ScheduleCache, itself
+#   pooled) and generating one is spent waiting for Gemini, so pooling the
+#   workflow would gain little;
+# - RateLimitConfig: configuration, read once when a RateLimiterService is created.
+#
+# The pool is enabled for the test suite (tests-config/application-test.toml)
+# but not yet here: under `pyronaut run`, async routes are served from
+# per-event-loop copies of Python objects, and Pyronaut 0.0.10 re-creates some of
+# them without their constructor arguments (e.g. SchemaAwareChatModel). Set
+# `enabled = true` once that is fixed.
 [micronaut.python.pool]
 enabled = false
+ignoreDependencies = ["DevoxxAgentWorkflowService", "RateLimitConfig"]
 
 [micronaut.http.client]
 read-timeout = "120s"
@@ -85,3 +95,13 @@ timeout-seconds = 6.0
 [micronaut.caches.schedules]
 expire-after-write = "120m"
 maximum-size = 500
+
+# Sliding rate-limit windows shared by every pooled RateLimiterService; idle
+# windows expire (they are at most `*-window-seconds` long).
+[micronaut.caches.ratelimit-sessions]
+expire-after-access = "5m"
+maximum-size = 100000
+
+[micronaut.caches.ratelimit-ips]
+expire-after-access = "5m"
+maximum-size = 100000

@@ -21,8 +21,8 @@ import logging
 import re
 
 from jakarta.annotation import PostConstruct
-from jakarta.inject import Singleton
 from micronaut.context.env import Environment
+from micronaut.context.python.scope import ContextPooled
 
 from .models import ConferenceTalk, conference_talk_from_dict, speakers_summary
 
@@ -46,7 +46,9 @@ def normalize_time(time: str | None) -> str:
     return f"0{t}" if re.fullmatch(r"\d:\d{2}", t) else t
 
 
-@Singleton
+# Pooled: each GraalPy context loads its own (immutable) copy of the catalog,
+# so searches run in parallel across the pool.
+@ContextPooled
 class DevoxxConferenceService:
     def __init__(self, environment: Environment):
         # Environment is the application's classpath ResourceLoader. (ResourceResolver is

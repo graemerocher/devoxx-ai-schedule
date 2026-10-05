@@ -11,18 +11,19 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any
 
-from jakarta.inject import Inject
+from jakarta.inject import Inject, Named
+from java.lang import StringBuffer
 from micronaut.context.annotation import Requires
 from micronaut.http import HttpRequest, HttpResponse
 from micronaut.http.annotation import Body, Controller, Get, Post
 
 from fake_chat_model import answer, task_for
-from mock_gemini_state import MockGeminiRequests
+from mock_gemini_state import RECORDED_REQUESTS
 
 Controller("/mock-gemini")
 Requires(property="mock-gemini.enabled", value="true")
 
-recorded: Annotated[MockGeminiRequests, Inject]
+recorded: Annotated[StringBuffer, Inject, Named(RECORDED_REQUESTS)]
 
 
 def _text(content: dict[str, Any] | None) -> str:
@@ -35,12 +36,13 @@ def generate_content(path: str, body: Annotated[str, Body], request: HttpRequest
     system = _text(payload.get("systemInstruction"))
     user = "\n".join(_text(c) for c in payload.get("contents", []) if c.get("role") == "user")
     task = task_for(system)
-    recorded.record({
+    # One JSON line per request in a Java buffer, readable from every GraalPy context
+    recorded.append(json.dumps({
         "path": path,
         "apiKey": request.getHeaders().get("x-goog-api-key"),
         "task": task,
         "generationConfig": payload.get("generationConfig", {}),
-    })
+    }) + "\n")
     text = json.dumps(answer(task, user, []))
     return HttpResponse.ok({
         "candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP"}],
@@ -50,4 +52,5 @@ def generate_content(path: str, body: Annotated[str, Body], request: HttpRequest
 
 @Get("/requests")
 def requests() -> list[dict[str, Any]]:
-    return recorded.requests
+    return [json.loads(line) for line in str(recorded.toString()).splitlines() if line]
+

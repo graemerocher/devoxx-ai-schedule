@@ -1,21 +1,24 @@
-"""Requests recorded by the mock Gemini API (see ``mock_gemini_routes``)."""
+"""Requests recorded by the mock Gemini API (see ``mock_gemini_routes``).
+
+The recorder is a Java ``StringBuffer`` bean (thread-safe, one JSON line per
+request), so the pooled route module records into the same buffer from every
+GraalPy context. A Java collection type would not do: Micronaut reads an
+injection point of a collection type as "every bean of the element type".
+"""
 
 from __future__ import annotations
 
-import threading
-from typing import Any
+from jakarta.inject import Named, Singleton
+from java.lang import StringBuffer
+from micronaut.context.annotation import Factory, Requires
 
-from jakarta.inject import Singleton
-from micronaut.context.annotation import Requires
+RECORDED_REQUESTS = "mock-gemini-requests"
 
 
-@Singleton
+@Factory
 @Requires(property="mock-gemini.enabled", value="true")
-class MockGeminiRequests:
-    def __init__(self):
-        self.requests: list[dict[str, Any]] = []
-        self._lock = threading.Lock()
-
-    def record(self, entry: dict[str, Any]) -> None:
-        with self._lock:
-            self.requests.append(entry)
+class MockGeminiRequestsFactory:
+    @Singleton
+    @Named(RECORDED_REQUESTS)
+    def recorded_requests(self) -> StringBuffer:
+        return StringBuffer()

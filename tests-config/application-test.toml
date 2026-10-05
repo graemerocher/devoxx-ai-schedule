@@ -9,3 +9,8 @@ port = -1
 [ratelimit]
 session-limit = 1000
 ip-limit = 10000
+
+# Exercise the pooled services (DevoxxConferenceService, RateLimiterService and
+# the pooled route modules) in every test run.
+[micronaut.python.pool]
+enabled = true

@@ -25,10 +25,11 @@ from __future__ import annotations
 import re
 from typing import Annotated
 
-from jakarta.inject import Named, Singleton
+from jakarta.inject import Named
 from java.lang import Object
 from micronaut.cache import SyncCache
 from micronaut.cache.annotation import Cacheable, CacheConfig
+from micronaut.context.python.scope import ContextPooled
 
 from .models import ScheduleResponse
 from .workflow import DevoxxAgentWorkflowService, ProgressListener
@@ -74,7 +75,10 @@ def rejected_from_error(error: BaseException) -> ScheduleResponse | None:
     return None
 
 
-@Singleton
+# Pooled like the routes that call it: its only state is the Java (Caffeine)
+# cache, and a RejectedSchedule raised here must be caught in the caller's
+# GraalPy context - Python exceptions do not cross contexts.
+@ContextPooled
 @CacheConfig(SCHEDULES_CACHE)
 class ScheduleCache:
     def __init__(
