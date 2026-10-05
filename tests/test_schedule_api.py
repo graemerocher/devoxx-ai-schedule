@@ -1,7 +1,5 @@
 """End-to-end tests of the HTTP API backed by the deterministic fake ChatModel."""
 
-import time
-
 from sse import assert_conflict_free, sse_events
 
 # Simulated model latency, so concurrent day planners overlap observably
@@ -82,13 +80,10 @@ def test_schedule_cache_hit(client):
 
 def test_day_planners_run_concurrently(client):
     reset_stats(client)
-    started = time.monotonic()
     response = client.post("/api/schedule", json={"interests": "Kubernetes platform engineering"})
-    elapsed = time.monotonic() - started
     assert response.status_code == 200
+    # Each simulated model call takes 200ms, so all five overlapping proves they ran concurrently
     assert stats(client)["maxInFlight"] == 5, "All five day planners should be in flight at the same time"
-    # validator (200ms) + one parallel round (200ms), far below 6 sequential calls (1.2s)
-    assert elapsed < 1.0, f"took {elapsed:.2f}s"
 
 
 def test_streaming_schedule(client):

@@ -212,6 +212,12 @@ Once started, open your browser:
 - Failure modes and latency are injected per test module with `fake-llm.*` properties (bound to a `@ConfigurationProperties` class), for example `fake-llm.fail-tasks = "plan-day"` or `fake-llm.fail-first-attempts = 1`.
 - `test_gemini_chat_model.py` exercises the real Micronaut LangChain4j Gemini `ChatModel` over HTTP against a mock Gemini API served by the application under test (`tests/mock_gemini_routes.py`).
 
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) uses [`micronaut-projects/setup-pyronaut`](https://github.com/micronaut-projects/setup-pyronaut) to provision and cache GraalVM, the Pyronaut CLI and a GraalPy environment. It then runs `pyronaut install`, `pyronaut validate-config --scenario production`, `pyronaut test` and `pyronaut build --jar`, and uploads the test reports and the JAR as artifacts. No API key is needed.
+
+---
+
 ## Fetching Latest Conference Schedules
 
 The application embeds the official Devoxx Belgium 2026 dataset in [`assets/devoxx-be-2026.json`](assets/devoxx-be-2026.json).
