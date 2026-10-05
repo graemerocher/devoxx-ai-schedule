@@ -12,7 +12,12 @@ from sse import assert_conflict_free, sse_events
 
 pytestmark = pytest.mark.skipif(not System.getenv("GEMINI_API_KEY"), reason="GEMINI_API_KEY is not set")
 
-CONTEXT_PROPERTIES = {"langchain4j.google-ai-gemini.enabled": "true"}
+CONTEXT_PROPERTIES = {
+    "langchain4j.google-ai-gemini.enabled": "true",
+    # The production budget (6s) keeps the UI snappy; here the point is to see
+    # Gemini's answer, so allow for a slow API call.
+    "alternatives.timeout-seconds": 60,
+}
 
 DETERMINISTIC_FALLBACK = "Personalized schedule curated for interests in"
 

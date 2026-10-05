@@ -38,6 +38,7 @@ from typing import Any, Callable
 from dev.langchain4j.agentic.scope import AgenticScope, DefaultAgenticScope
 from dev.langchain4j.invocation import LangChain4jManaged
 from jakarta.inject import Singleton
+from micronaut.context.annotation import ConfigurationProperties
 from java.util import Map
 
 from .agent_listeners import AGENT2
@@ -72,7 +73,6 @@ from .progress import REQUEST_ID_KEY, ProgressListener, ProgressRegistry
 LOG = logging.getLogger(__name__)
 
 MAX_INTERESTS_LENGTH = 500
-ALTERNATIVES_TIMEOUT_SECONDS = 6.0
 
 CONFERENCE_DAYS: list[tuple[str, str, str]] = [
     ("monday", "2026-10-05", "Monday, Oct 5 (Deep Dives & Labs)"),
@@ -126,6 +126,12 @@ async def run_agent(scope: Any, call: Callable[[], Any]) -> Any:
     return await asyncio.get_running_loop().run_in_executor(None, invoke)
 
 
+@ConfigurationProperties("alternatives")
+class AlternativesConfig:
+    timeout_seconds: float = 6.0
+    """How long to wait for the LLM's recommendation before ranking alternatives deterministically"""
+
+
 @Singleton
 class DevoxxAgentWorkflowService:
     def __init__(
@@ -136,6 +142,7 @@ class DevoxxAgentWorkflowService:
         schedule_builder_agent: ScheduleBuilderAgent,
         alternative_agent: TalkAlternativeAgent,
         progress_registry: ProgressRegistry,
+        alternatives_config: AlternativesConfig,
     ):
         self.conference_service = conference_service
         self.validator_agent = validator_agent
@@ -143,6 +150,7 @@ class DevoxxAgentWorkflowService:
         self.schedule_builder_agent = schedule_builder_agent
         self.alternative_agent = alternative_agent
         self.progress_registry = progress_registry
+        self.alternatives_timeout = alternatives_config.timeout_seconds
 
     async def process_schedule_request(
         self, user_interests: str | None, progress: ProgressListener | None = None
@@ -437,7 +445,7 @@ class DevoxxAgentWorkflowService:
                     current.room or "Main",
                     formatted_candidates,
                 )),
-                ALTERNATIVES_TIMEOUT_SECONDS,
+                self.alternatives_timeout,
             )
             for selection in (result.selections or []) if result is not None else []:
                 if selection is None:
