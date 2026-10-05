@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # GraalVM JDK, Pyronaut CLI, GraalPy .venv with pytest and `pyronaut setup`, all cached
+      - uses: micronaut-projects/setup-pyronaut@v1
+
+      - name: Install dependencies
+        run: pyronaut install
+
+      - name: Validate production configuration
+        run: pyronaut validate-config --scenario production
+
+      # Runs against the fake ChatModel. tests/test_gemini_live.py additionally
+      # exercises the real Gemini API when the GEMINI_API_KEY secret is available
+      # (it is skipped otherwise, e.g. for pull requests from forks).
+      - name: Test
+        run: pyronaut test
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: __pyronaut__/reports/
+          if-no-files-found: ignore
+
+      - name: Build runnable JAR
+        run: pyronaut build --jar
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v7
+        with:
+          name: dvxaisched-jar
+          path: dist/*.jar

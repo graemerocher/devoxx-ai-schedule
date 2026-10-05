@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runtime image for the Pyronaut fat JAR. Build the JAR first with
-# `pyronaut build --jar` (or `just build`). The embedded GraalPy runtime needs a
-# GraalVM JDK that matches its polyglot version (25.4.4.1.1) so that Python code
-# is JIT-compiled: the 25i4 image ships Oracle GraalVM 25.0.4.1.1.
-FROM container-registry.oracle.com/graalvm/jdk:25i4
-WORKDIR /app
+"""Root route: redirects to the web UI."""
 
-COPY dist/dvxaisched-0.1.0.jar /app/application.jar
+from __future__ import annotations
 
-ENV PORT=8080
-EXPOSE 8080
+from java.net import URI
+from micronaut.http import HttpResponse
+from micronaut.http.annotation import Get
 
-ENTRYPOINT ["java", "-jar", "/app/application.jar"]
+
+@Get("/")
+def index() -> HttpResponse:
+    return HttpResponse.redirect(URI.create("/index.html"))

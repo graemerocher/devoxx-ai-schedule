@@ -1,7 +1,9 @@
 .git
-.gradle
-build/
-bin/
+.venv/
+__pyronaut__/
+.micronaut/
+.pytest_cache/
+__pycache__/
 stitch_*.html
 *.log
 .DS_Store

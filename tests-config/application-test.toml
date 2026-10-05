@@ -1,0 +1,11 @@
+# Tests run against a deterministic fake ChatModel (tests/fake_chat_model.py)
+# instead of Gemini, so no API key or network access is needed.
+[langchain4j.google-ai-gemini]
+enabled = false
+
+[micronaut.server]
+port = -1
+
+[ratelimit]
+session-limit = 1000
+ip-limit = 10000
