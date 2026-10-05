@@ -27,13 +27,17 @@ jobs:
       - name: Validate production configuration
         run: pyronaut validate-config --scenario production
 
-      # Runs against the fake ChatModel: no Gemini API key or network needed
+      # Runs against the fake ChatModel. tests/test_gemini_live.py additionally
+      # exercises the real Gemini API when the GEMINI_API_KEY secret is available
+      # (it is skipped otherwise, e.g. for pull requests from forks).
       - name: Test
         run: pyronaut test
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - name: Upload test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-reports
           path: __pyronaut__/reports/
@@ -43,7 +47,7 @@ jobs:
         run: pyronaut build --jar
 
       - name: Upload JAR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dvxaisched-jar
           path: dist/*.jar
