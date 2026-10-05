@@ -51,7 +51,9 @@ incremental = false
 daemon = false
 
 [tool.pyronaut.test]
-engine = "pytest"
+# pytest owns the unit and API suites; JUnit owns the Playwright browser suite
+# (JUnit 5 Python modules), both in the same `pyronaut test` run.
+engine = "both"
 
 [tool.pyronaut.ide-stubs]
 packages = ["io.micronaut", "jakarta", "dev.langchain4j"]
@@ -93,4 +95,6 @@ build = [
 test = [
   "io.micronaut.pyronaut:micronaut-pyronaut-pytest",
   "io.micronaut.pyronaut:micronaut-pyronaut-requests",
+  "io.micronaut.test:micronaut-test-junit5",
+  "com.microsoft.playwright:playwright:1.63.0",
 ]

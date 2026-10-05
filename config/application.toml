@@ -75,6 +75,11 @@ session-window-seconds = 60
 ip-limit = 60
 ip-window-seconds = 60
 
+# Talk swaps wait this long for the LLM's recommendation before falling back to
+# a deterministic ranking, keeping the modal responsive.
+[alternatives]
+timeout-seconds = 6.0
+
 # Cache of synthesized schedules keyed by normalized interests (avoids
 # repeated Gemini calls for common prompts). See dvxaisched.cache.
 [micronaut.caches.schedules]
